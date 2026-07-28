@@ -23,6 +23,8 @@ import json
 import math
 import sys
 import traceback
+import importlib
+import shutil
 
 import torch
 import torchvision.transforms.functional as F_vision
@@ -152,60 +154,268 @@ def read_audio_channels(model_id, default=128):
     return default
 
 
-def try_quantize_text_encoder_4bit(pipe):
+def read_model_index_components(model_id):
     """
-    Intenta recargar el text encoder cuantizado a 4-bit (nf4) para que quepa
-    entero en VRAM. Si falla por cualquier motivo, devuelve False y el pipe
-    se queda con su text encoder original en CPU.
+    Lee model_index.json y devuelve los componentes del pipeline.
     """
-    te = getattr(pipe, "text_encoder", None)
-    if te is None:
-        print("[4bit] El pipeline no tiene text_encoder; se omite.")
-        return False
+    path = os.path.join(model_id, "model_index.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        out = {}
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if key.startswith("_"):
+                    continue
+                if isinstance(value, (list, tuple)) and len(value) == 2:
+                    out[key] = value
+        return out
+    except Exception as exc:
+        print("[LIGHT] No se pudo leer model_index.json: {}".format(exc))
+        return {}
+
+
+def resolve_component_class(model_id, component_name, current_object=None):
+    """
+    Resuelve la clase de un componente del pipeline a partir de model_index.json.
+    """
+    info = read_model_index_components(model_id).get(component_name)
+    if info is not None:
+        module_name, class_name = info
+        try:
+            module = importlib.import_module(module_name)
+            return getattr(module, class_name)
+        except Exception as exc:
+            print("[LIGHT] No se pudo importar {}.{}: {}".format(module_name, class_name, exc))
+    if current_object is not None:
+        return type(current_object)
+    return None
+
+
+def list_text_encoder_components(pipe):
+    """
+    Detecta todos los text encoders presentes en el pipeline.
+    """
+    names = []
+
+    # Desde model_index.json
+    for key in read_model_index_components(MODEL_ID).keys():
+        if key.lower().startswith("text_encoder") and key not in names:
+            names.append(key)
+
+    # Por si existe alguna instancia directa en el pipeline
+    for attr in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+        if hasattr(pipe, attr) and attr not in names:
+            names.append(attr)
+
+    return names
+
+
+def unload_pipeline_component(pipe, name):
+    """
+    Libera de RAM un componente del pipeline antes de recargarlo.
+    """
+    obj = getattr(pipe, name, None)
+    if obj is not None:
+        try:
+            setattr(pipe, name, None)
+        except Exception:
+            pass
+        try:
+            del obj
+        except Exception:
+            pass
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def auto_max_memory_for_cuda():
+    """
+    Limita la memoria máxima usada por accelerate en modo auto.
+    """
+    try:
+        free, total = torch.cuda.mem_get_info()
+        free_gb = free / 1e9
+        limit_gb = max(2.0, free_gb - 1.0)
+        return {
+            0: "{:.0f}GiB".format(limit_gb),
+            "cpu": "10GiB",
+        }
+    except Exception:
+        return {
+            0: "10GiB",
+            "cpu": "10GiB",
+        }
+
+
+def load_precache_pipeline_light(model_id, skip_text_encoders=True):
+    """
+    Carga el pipeline en CPU evitando cargar de golpe los text encoders.
+    Esto reduce muchísimo el primer pico de RAM.
+    """
+    overrides = {
+        "transformer": None,
+    }
+
+    components = read_model_index_components(model_id)
+
+    # No cargar text encoders originales si vamos a cuantizarlos después
+    if skip_text_encoders:
+        for name in components.keys():
+            if name.lower().startswith("text_encoder"):
+                overrides[name] = None
+
+    try:
+        pipe = DiffusionPipeline.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            **overrides
+        )
+        return pipe
+    except TypeError as exc:
+        print("[LIGHT] Overrides no aceptados por el pipeline ({}).".format(exc))
+        print("[LIGHT] Fallback: cargando solo sin transformer.")
+        return DiffusionPipeline.from_pretrained(
+            model_id,
+            transformer=None,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
+
+
+def quantize_one_text_encoder_4bit(pipe, component_name):
+    """
+    Cuantiza UN text encoder concreto:
+    - libera antes el original de RAM
+    - intenta cargarlo shard a shard directo a VRAM
+    - si falla, intenta auto con offload
+    """
+    current_object = getattr(pipe, component_name, None)
+    component_class = resolve_component_class(MODEL_ID, component_name, current_object)
+
+    if component_class is None:
+        print("[4bit] No se pudo resolver la clase de {}.".format(component_name))
+        return False, None
+
+    # CLAVE: liberar el original antes de cargar el cuantizado
+    print("[4bit] Liberando {} de RAM antes de cuantizar...".format(component_name))
+    unload_pipeline_component(pipe, component_name)
 
     try:
         from transformers import BitsAndBytesConfig
-    except Exception as e:
-        print("[4bit] transformers.BitsAndBytesConfig no disponible:", e)
-        return False
+    except Exception as exc:
+        print("[4bit] BitsAndBytesConfig no disponible: {}".format(exc))
+        return False, None
 
-    te_cls = type(te)
-    subfolder = "text_encoder"
+    bnb_cfg = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
 
-    # Probar varios nombres de subcarpeta por si el layout cambia.
-    candidates = [subfolder, "text_encoder_2", ""]
+    offload_dir = os.path.join(".", "_offload_tmp_{}".format(component_name))
 
-    for sub in candidates:
+    strategies = [
+        (
+            "cuda:0 directo",
+            {
+                "device_map": "cuda:0",
+            },
+        ),
+        (
+            "auto con offload",
+            {
+                "device_map": "auto",
+                "max_memory": auto_max_memory_for_cuda(),
+                "offload_folder": offload_dir,
+            },
+        ),
+    ]
+
+    for label, extra_kwargs in strategies:
+        kwargs = {
+            "quantization_config": bnb_cfg,
+            "torch_dtype": torch.bfloat16,
+            "low_cpu_mem_usage": True,
+            "subfolder": component_name,
+        }
+        kwargs.update(extra_kwargs)
+
         try:
-            bnb_cfg = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
+            print("[4bit] {} -> intentando {}...".format(component_name, label))
+            new_object = component_class.from_pretrained(MODEL_ID, **kwargs)
+            setattr(pipe, component_name, new_object)
 
-            kwargs = dict(
-                quantization_config=bnb_cfg,
-                torch_dtype=torch.bfloat16,
-                low_cpu_mem_usage=True,
-            )
-            if sub:
-                kwargs["subfolder"] = sub
+            print("[4bit] {} cuantizado OK con {}.".format(component_name, label))
+            print("[4bit] VRAM actual: {:.2f} GB".format(vram_gb()))
 
-            print(f"[4bit] Intentando cuantizar text_encoder ({te_cls.__name__}, subfolder={sub or '<raíz>'})...")
+            if os.path.exists(offload_dir):
+                try:
+                    shutil.rmtree(offload_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
-            new_te = te_cls.from_pretrained(MODEL_ID, **kwargs)
+            return True, label
 
-            pipe.text_encoder = new_te
-            print("[4bit] OK: text encoder cuantizado a 4-bit y residente en VRAM.")
-            return True
+        except Exception as exc:
+            print("[4bit] {} fallo con {}: {}".format(component_name, label, exc))
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        except Exception as e:
-            print(f"[4bit] Fallo con subfolder={sub or '<raíz>'}: {e}")
-            continue
+    # Fallback: cargar original en CPU para no romper el pipeline
+    try:
+        print("[4bit] {} -> recargando original bf16 en CPU como fallback...".format(component_name))
+        fallback_object = component_class.from_pretrained(
+            MODEL_ID,
+            subfolder=component_name,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
+        setattr(pipe, component_name, fallback_object)
+    except Exception as exc:
+        print("[4bit] CRITICO: no se pudo restaurar {}: {}".format(component_name, exc))
 
-    print("[4bit] No se pudo cuantizar el text encoder; se usará el modo de offload configurado.")
-    return False
+    return False, None
+
+
+def try_quantize_text_encoders_4bit(pipe):
+    """
+    Cuantiza TODOS los text encoders detectados, uno detrás de otro.
+    Devuelve:
+      - True/False si todos se cuantizaron correctamente
+      - text_device recomendado
+    """
+    names = list_text_encoder_components(pipe)
+
+    if not names:
+        print("[4bit] No se detectaron text encoders; se omite.")
+        return False, "cpu"
+
+    print("[4bit] Text encoders detectados: {}".format(", ".join(names)))
+
+    all_ok = True
+
+    for name in names:
+        ok, label = quantize_one_text_encoder_4bit(pipe, name)
+        if not ok:
+            all_ok = False
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if not all_ok:
+        print("[4bit] Algun text encoder no se pudo cuantizar; se usara fallback/offload.")
+        return False, "cpu"
+
+    return True, "cuda"
 
 
 def _patch_module_to_noop_device(module):
@@ -280,11 +490,11 @@ def setup_offload(pipe, mode):
     # mode == "sequential"
     try:
         pipe.enable_sequential_cpu_offload(device="cuda")
-        # Blindar text_encoder y connectors contra .to("cuda") internos.
-        _patch_module_to_noop_device(text_encoder)
-        _patch_module_to_noop_device(connectors)
-        print("[OFFLOAD] sequential -> text encoder capa por capa en VRAM.")
-        print(f"[VRAM] pico tras setup: {vram_peak_gb():.2f} GB")
+        # Blindar todos los text encoders y connectors contra .to("cuda") internos.
+        for attr in ("text_encoder", "text_encoder_2", "text_encoder_3", "connectors"):
+            _patch_module_to_noop_device(getattr(pipe, attr, None))
+        #print("[OFFLOAD] sequential -> text encoder capa por capa en VRAM.")
+        #print(f"[VRAM] pico tras setup: {vram_peak_gb():.2f} GB")
         return "cuda"
     except Exception as e:
         print("[OFFLOAD] sequential falló, fallback a cpu:", e)
@@ -485,39 +695,52 @@ def preprocess_ltx23():
     # Cargar pipeline en CPU (SIN .to("cuda")).
     # ------------------------------------------------------------------
     print()
-    print("Cargando LTX-2.3 en CPU (sin transformer)...")
+    if TEXT_ENCODER_4BIT:
+        print("Cargando LTX-2.3 en CPU (sin transformer y SIN text encoders)...")
+    else:
+        print("Cargando LTX-2.3 en CPU (sin transformer)...")
 
-    pipe = DiffusionPipeline.from_pretrained(
+    pipe = load_precache_pipeline_light(
         MODEL_ID,
-        transformer=None,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
+        skip_text_encoders=TEXT_ENCODER_4BIT,
     )
 
     print("Pipeline:", type(pipe).__name__)
     print("VAE:", type(getattr(pipe, "vae", None)).__name__)
-    print("Text encoder:", type(getattr(pipe, "text_encoder", None)).__name__)
+
+    for te_name in list_text_encoder_components(pipe):
+        te_obj = getattr(pipe, te_name, None)
+        if te_obj is None:
+            print("{}: None (se cargara cuantizado)".format(te_name))
+        else:
+            print("{}: {}".format(te_name, type(te_obj).__name__))
+
     print("Audio VAE:", type(getattr(pipe, "audio_vae", None)).__name__)
 
     # ------------------------------------------------------------------
-    # Opcional: cuantizar text encoder a 4-bit (experimental).
+    # Opcional: cuantizar TODOS los text encoders a 4-bit.
     # ------------------------------------------------------------------
     used_4bit = False
+    text_device = "cpu"
+
     if TEXT_ENCODER_4BIT:
-        used_4bit = try_quantize_text_encoder_4bit(pipe)
+        used_4bit, text_device = try_quantize_text_encoders_4bit(pipe)
 
     # ------------------------------------------------------------------
-    # Offload. Si 4bit tuvo éxito, el text encoder ya está en VRAM y
-    # basta con poner el VAE también (modo "none"-like pero sin tocar
-    # el text encoder). Si no, aplicamos el modo configurado.
+    # Offload.
     # ------------------------------------------------------------------
     if used_4bit:
         vae = getattr(pipe, "vae", None)
         if vae is not None:
             vae.to("cuda")
+
+        # Evitar que el pipeline intente moverlos de golpe a CUDA más adelante
+        for attr in ("text_encoder", "text_encoder_2", "text_encoder_3", "connectors"):
+            _patch_module_to_noop_device(getattr(pipe, attr, None))
+
         text_device = "cuda"
-        print("[OFFLOAD] 4bit activo -> text encoder 4-bit + VAE en VRAM.")
-        print(f"[VRAM] tras 4bit + VAE: {vram_gb():.2f} GB")
+        print("[OFFLOAD] 4bit activo -> text encoder(s) 4-bit + VAE en VRAM.")
+        print("[VRAM] tras 4bit + VAE: {:.2f} GB".format(vram_gb()))
     else:
         text_device = setup_offload(pipe, PRECACHE_OFFLOAD)
 
