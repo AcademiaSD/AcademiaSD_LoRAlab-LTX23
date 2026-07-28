@@ -1,0 +1,79 @@
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+
+title AcademiaSD - Krea-2 LoRA Trainer Updater
+color 0B
+
+cd /d "%~dp0"
+
+echo ================================================================
+echo   ACADEMIASD - LTX2.3 LORALAB UPDATER
+echo   [EN] Repository Update Utility
+echo   [ES] Utilidad de Actualizacion del Repositorio
+echo ================================================================
+echo.
+
+rem 1. Check Git
+where git >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [ERROR] Git is not installed or not available in PATH.
+    echo [ERROR] Git no esta instalado o no esta disponible en el PATH.
+    echo.
+    echo [EN] Please install Git from https://git-scm.com/
+    echo [ES] Por favor instala Git desde https://git-scm.com/
+    echo.
+    pause
+    exit /b 1
+)
+
+rem 2. Check .git
+if not exist ".git" (
+    echo [INFO] Initializing Git repository...
+    echo [INFO] Inicializando repositorio Git...
+    echo.
+    git init >nul 2>&1
+    git remote add origin https://github.com/AcademiaSD/AcademiaSD_LoRAlab-LTX23.git >nul 2>&1
+)
+
+rem 3. Ensure remote URL
+git remote set-url origin https://github.com/AcademiaSD/AcademiaSD_LoRAlab-LTX23.git >nul 2>&1
+
+echo [EN] Syncing latest updates from GitHub...
+echo [ES] Sincronizando ultimas actualizaciones desde GitHub...
+echo.
+
+rem 4. Fetch changes
+git fetch origin main >nul 2>&1
+if errorlevel 1 (
+    git fetch origin master >nul 2>&1
+)
+
+rem 5. Force reset
+git checkout -f main >nul 2>&1
+if errorlevel 1 (
+    git checkout -f master >nul 2>&1
+)
+
+git reset --hard origin/main >nul 2>&1
+if errorlevel 1 (
+    git reset --hard origin/master >nul 2>&1
+)
+
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Failed to update repository from GitHub.
+    echo [ERROR] No se pudo actualizar el repositorio desde GitHub.
+    echo.
+    pause
+    exit /b 1
+)
+
+echo.
+echo ================================================================
+echo [OK] Repository updated successfully! / Repositorio actualizado!
+echo ================================================================
+echo.
+echo [EN] Update process completed.
+echo [ES] Proceso de actualizacion completado.
+echo.
+pause
