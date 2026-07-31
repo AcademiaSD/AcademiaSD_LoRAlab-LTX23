@@ -87,12 +87,12 @@ Here is the exact architectural breakdown of how this is achieved:
 
 1. **Clone or download the repository**:
    ```bash
-   git clone https://github.com/AcademiaSD/AcademiaSD-Krea2-LoRAlab.git
-   cd AcademiaSD-Krea2-LoRAlab
+   git clone https://github.com/AcademiaSD/AcademiaSD-LoRAlab-LTX23.git
+   cd AcademiaSD-LTX23-LoRAlab
    ```
 
 2. **Install virtual environment & dependencies**:
-   Double-click `Install_LoRAlab-Krea2.bat` to automatically set up the Python virtual environment (`venv`) and install all required core libraries.
+   Double-click `Install_LoRAlab-LTX23.bat` to automatically set up the Python virtual environment (`venv`) and install all required core libraries.
 
 3. **(Optional) Install Triton & SageAttention 2.2**:
    Double-click `Install_Triton&SageAtten220.bat` to install Triton and SageAttention 2.2 for enhanced attention speedup and memory optimization.
