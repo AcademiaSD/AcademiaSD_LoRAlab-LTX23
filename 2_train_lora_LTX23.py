@@ -1,21 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-2_train_lora_LTX23.py
-
-Trainer LoRA para LTX-2.3 (image-only / personaje) con:
-- Descarga automática del modelo (aviso >100 GB).
-- Pre-cache de texto y eliminación de connectors de VRAM.
-- Padding de texto a múltiplo de learnable registers (128).
-- Resume / stop / continue (signal handlers).
-- Preview con seed / steps / CFG.
-- Optimizaciones de VRAM (attention eficiente, grad checkpointing, cast bf16).
-- EXPORT LoRA en formato estándar ComfyUI / Civitai:
-    * prefijo configurable (default 'diffusion_model.'),
-    * SIN el token '.default' del adapter de PEFT,
-    * scaling (alpha/rank) 'horneado' en lora_B para que strength=1.0
-      en ComfyUI reproduzca EXACTAMENTE el entrenamiento.
-"""
-
 import os
 import platform
 
@@ -53,7 +36,6 @@ import torch
 import torch.nn.functional as F
 
 from diffusers import DiffusionPipeline
-
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -68,9 +50,7 @@ from bitsandbytes.nn import (
 
 from safetensors import safe_open
 from safetensors.torch import save_file, load_file
-
 from PIL import Image
-
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -79,27 +59,43 @@ except Exception:
     pass
 
 
-# ============================================================================
-# CONFIG
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Activation offload
+# ---------------------------------------------------------------------------
+try:
+    from torch.autograd.graph import save_on_cpu as _save_on_cpu_ctx
+    _SAVE_ON_CPU_AVAILABLE = True
+except Exception:
+    _save_on_cpu_ctx = None
+    _SAVE_ON_CPU_AVAILABLE = False
 
+ACTIVATION_OFFLOAD_ACTIVE = False
+
+
+# ===========================================================================
+# CONFIG
+# ===========================================================================
 DEFAULTS = {
     "model_id": "./LTX23-NF4",
     "cache_dir": "./cached_data_ltx23",
     "output_dir": "./ltx23_lora_output",
-    "total_steps": 500,
+
+    "total_steps": 800,
     "batch_size": 1,
     "grad_accum_steps": 4,
     "lr": 1e-4,
     "min_lr_ratio": 0.1,
     "warmup_steps": 100,
-    "lora_rank": 8,
-    "lora_alpha": 16,
+
+    "lora_rank": 32,
+    "lora_alpha": 32,
     "weight_decay": 0.0,
     "max_grad_norm": 1.0,
-    "save_every": 25,
-    "seed": 42,
+
+    "save_every": 20,
+    "seed": 314159,
     "frame_rate": 24.0,
+
     "project_name": "",
     "trigger_word": "",
 
@@ -111,17 +107,37 @@ DEFAULTS = {
 
     # Preview.
     "preview_every": 0,
-    "preview_steps": 8,
-    "preview_cfg": 1.0,
+    "preview_steps": 30,
+    "preview_cfg": 3.0,
+    "preview_sampler": "euler",
+    "preview_lora_scale": 1.0,
+    "preview_cfg_max": 7.0,
+    "preview_cfg_rescale": 0.0,
     "preview_caption_mode": "first",
     "preview_custom_prompt": "",
-    "preview_vae_inverse_scale": False,
 
-    # Formato de keys del LoRA exportado (ComfyUI / Civitai).
-    # 'diffusion_model.' = loader nativo de ComfyUI.
-    # 'transformer.'     = algunos nodos custom / formatos PEFT.
-    # ''                 = sin prefijo.
+    # Preview diagnóstico.
+    "preview_mode": "gen",                # gen | recon | onestep
+    "preview_recon_sigma": 0.55,
+    "preview_frame_index": -1,
+    "preview_shift": 1.0,
+    "preview_vae_fp32": True,
+    "preview_audio_cfg": 1.0,
+    "preview_sample_name": "",
+    "preview_compare_base": False,
+
+    # VAE.
+    # True  -> latent * std / scaling_factor + mean
+    # False -> latent * std + mean
+    "preview_vae_use_scaling_factor": True,
+
+    # Formato de keys del LoRA exportado.
     "lora_key_prefix": "diffusion_model.",
+
+    # Modo baja VRAM.
+    "low_vram_12gb": True,
+    "activation_offload": True,
+    "loss_chunk_elements": 2000000,
 }
 
 CONFIG_PATH = "train_settings.json"
@@ -133,10 +149,10 @@ HF_NF4_REPO_ID = "AcademiaSD/LTX23_NF4"
 if os.path.exists(CONFIG_PATH):
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    print(f"[OK] Configuración cargada: {CONFIG_PATH}")
+    print("[OK] Configuración cargada: {}".format(CONFIG_PATH))
 else:
     cfg = {}
-    print(f"[!] No existe {CONFIG_PATH}; usando valores por defecto.")
+    print("[!] No existe {}; usando valores por defecto.".format(CONFIG_PATH))
 
 
 def cfg_get(key, default):
@@ -149,33 +165,34 @@ def cfg_get(key, default):
 
 def _cfg_bool(key, default):
     value = cfg_get(key, default)
-
     if isinstance(value, bool):
         return value
-
     if isinstance(value, (int, float)):
         return bool(value)
-
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "y", "on")
-
     return bool(value)
 
 
 MODEL_ID = str(cfg_get("model_id", DEFAULTS["model_id"])).strip()
+
 TOTAL_STEPS = int(cfg_get("total_steps", DEFAULTS["total_steps"]))
 BATCH_SIZE = int(cfg_get("batch_size", DEFAULTS["batch_size"]))
 GRAD_ACCUM_STEPS = int(cfg_get("grad_accum_steps", DEFAULTS["grad_accum_steps"]))
+
 LR = float(cfg_get("lr", DEFAULTS["lr"]))
 MIN_LR_RATIO = float(cfg_get("min_lr_ratio", DEFAULTS["min_lr_ratio"]))
 WARMUP_STEPS = int(cfg_get("warmup_steps", DEFAULTS["warmup_steps"]))
+
 LORA_RANK = int(cfg_get("lora_rank", DEFAULTS["lora_rank"]))
 LORA_ALPHA = int(cfg_get("lora_alpha", DEFAULTS["lora_alpha"]))
 WEIGHT_DECAY = float(cfg_get("weight_decay", DEFAULTS["weight_decay"]))
 MAX_GRAD_NORM = float(cfg_get("max_grad_norm", DEFAULTS["max_grad_norm"]))
+
 SAVE_EVERY = int(cfg_get("save_every", DEFAULTS["save_every"]))
 SEED = int(cfg_get("seed", DEFAULTS["seed"]))
 FRAME_RATE = float(cfg_get("frame_rate", DEFAULTS["frame_rate"]))
+
 TRIGGER_WORD = str(cfg_get("trigger_word", DEFAULTS["trigger_word"])).strip()
 PROJECT_NAME = str(cfg_get("project_name", DEFAULTS["project_name"])).strip()
 
@@ -187,20 +204,42 @@ USE_AUDIO_LOSS = _cfg_bool("use_audio_loss", DEFAULTS["use_audio_loss"])
 PREVIEW_EVERY = int(cfg_get("preview_every", DEFAULTS["preview_every"]))
 PREVIEW_STEPS = int(cfg_get("preview_steps", DEFAULTS["preview_steps"]))
 PREVIEW_CFG = float(cfg_get("preview_cfg", DEFAULTS["preview_cfg"]))
+PREVIEW_SAMPLER = str(cfg_get("preview_sampler", DEFAULTS["preview_sampler"])).strip().lower()
+PREVIEW_LORA_SCALE = float(cfg_get("preview_lora_scale", DEFAULTS["preview_lora_scale"]))
+PREVIEW_CFG_MAX = float(cfg_get("preview_cfg_max", DEFAULTS["preview_cfg_max"]))
+PREVIEW_CFG_RESCALE = float(cfg_get("preview_cfg_rescale", DEFAULTS["preview_cfg_rescale"]))
 PREVIEW_CAPTION_MODE = str(cfg_get("preview_caption_mode", DEFAULTS["preview_caption_mode"])).strip().lower()
 PREVIEW_CUSTOM_PROMPT = str(cfg_get("preview_custom_prompt", DEFAULTS["preview_custom_prompt"])).strip()
-PREVIEW_VAE_INVERSE_SCALE = _cfg_bool("preview_vae_inverse_scale", DEFAULTS["preview_vae_inverse_scale"])
+
+PREVIEW_MODE = str(cfg_get("preview_mode", DEFAULTS["preview_mode"])).strip().lower()
+PREVIEW_RECON_SIGMA = float(cfg_get("preview_recon_sigma", DEFAULTS["preview_recon_sigma"]))
+PREVIEW_FRAME_INDEX = int(cfg_get("preview_frame_index", DEFAULTS["preview_frame_index"]))
+PREVIEW_SHIFT = float(cfg_get("preview_shift", DEFAULTS["preview_shift"]))
+PREVIEW_VAE_FP32 = _cfg_bool("preview_vae_fp32", DEFAULTS["preview_vae_fp32"])
+PREVIEW_AUDIO_CFG = float(cfg_get("preview_audio_cfg", DEFAULTS["preview_audio_cfg"]))
+PREVIEW_SAMPLE_NAME = str(cfg_get("preview_sample_name", DEFAULTS["preview_sample_name"])).strip()
+PREVIEW_COMPARE_BASE = _cfg_bool("preview_compare_base", DEFAULTS["preview_compare_base"])
+
+PREVIEW_VAE_USE_SCALING_FACTOR = _cfg_bool(
+    "preview_vae_use_scaling_factor",
+    DEFAULTS["preview_vae_use_scaling_factor"],
+)
 
 LORA_KEY_PREFIX = str(cfg_get("lora_key_prefix", DEFAULTS["lora_key_prefix"]))
 
+LOW_VRAM_12GB = _cfg_bool("low_vram_12gb", DEFAULTS["low_vram_12gb"])
+ACTIVATION_OFFLOAD = _cfg_bool("activation_offload", DEFAULTS["activation_offload"])
+LOSS_CHUNK_ELEMENTS = int(cfg_get("loss_chunk_elements", DEFAULTS["loss_chunk_elements"]))
+
+if PREVIEW_MODE not in ("gen", "recon", "onestep"):
+    PREVIEW_MODE = "gen"
 
 if PROJECT_NAME:
-    CACHE_DIR = f"./cached_data_ltx23_{PROJECT_NAME}"
-    OUTPUT_DIR = f"./ltx23_lora_output_{PROJECT_NAME}"
+    CACHE_DIR = "./cached_data_ltx23_{}".format(PROJECT_NAME)
+    OUTPUT_DIR = "./ltx23_lora_output_{}".format(PROJECT_NAME)
 else:
     CACHE_DIR = str(cfg_get("cache_dir", DEFAULTS["cache_dir"])).strip()
     OUTPUT_DIR = str(cfg_get("output_dir", DEFAULTS["output_dir"])).strip()
-
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -209,55 +248,68 @@ OPT_FILE = os.path.join(OUTPUT_DIR, "optimizer.pt")
 STEP_FILE = os.path.join(OUTPUT_DIR, "current_step.txt")
 
 
-# ============================================================================
+# ===========================================================================
 # BANNER
-# ============================================================================
-
+# ===========================================================================
 print()
 print("=" * 80)
-print(" LTX-2.3 LoRA TRAINER")
+print(" LTX-2.3 LoRA TRAINER ")
 print("=" * 80)
-print(f"  Model ID / ID Modelo        : {MODEL_ID}")
-print(f"  Base Repo                   : {HF_BASE_REPO_ID}")
-print(f"  NF4 Repo                    : {HF_NF4_REPO_ID}")
-print(f"  Project / Proyecto          : {PROJECT_NAME if PROJECT_NAME else '(Default)'}")
-print(f"  Trigger Word / Palabra      : {TRIGGER_WORD}")
-print(f"  Cache Dir / Carpeta Caché   : {CACHE_DIR}")
-print(f"  Output Dir / Salida         : {OUTPUT_DIR}")
-print(f"  Total Steps / Pasos         : {TOTAL_STEPS}")
-print(f"  Learning Rate / LR          : {LR}")
-print(f"  LoRA Rank/Alpha             : {LORA_RANK}/{LORA_ALPHA}")
-print(f"  Batch / Grad Accum          : {BATCH_SIZE}/{GRAD_ACCUM_STEPS}")
-print(f"  Max Text Tokens             : {MAX_TEXT_TOKENS}")
-print(f"  LoRA Only Attention         : {'ON' if LORA_ONLY_ATTN else 'OFF'}")
-print(f"  Use Audio Loss              : {'ON' if USE_AUDIO_LOSS else 'OFF'}")
-print(f"  Preview Mode / Prompt       : Mode={PREVIEW_CAPTION_MODE} | Custom='{PREVIEW_CUSTOM_PROMPT}'")
-print(f"  Preview Every / Steps / CFG : {PREVIEW_EVERY} / {PREVIEW_STEPS} / {PREVIEW_CFG}")
-print(f"  LoRA Key Prefix / Prefijo   : '{LORA_KEY_PREFIX}'")
-print(f"  Seed Configured / Semilla   : {SEED} ({'RANDOM' if SEED <= 0 else 'FIXED'})")
+print("  Model ID / ID Modelo        : {}".format(MODEL_ID))
+print("  Base Repo                   : {}".format(HF_BASE_REPO_ID))
+print("  NF4 Repo                    : {}".format(HF_NF4_REPO_ID))
+print("  Project / Proyecto          : {}".format(PROJECT_NAME if PROJECT_NAME else "(Default)"))
+print("  Trigger Word / Palabra      : {}".format(TRIGGER_WORD))
+print("  Cache Dir / Carpeta Cache   : {}".format(CACHE_DIR))
+print("  Output Dir / Salida         : {}".format(OUTPUT_DIR))
+print("  Total Steps / Pasos         : {}".format(TOTAL_STEPS))
+print("  Learning Rate / LR          : {}".format(LR))
+print("  LoRA Rank/Alpha             : {}/{}".format(LORA_RANK, LORA_ALPHA))
+print("  Batch / Grad Accum          : {}/{}".format(BATCH_SIZE, GRAD_ACCUM_STEPS))
+print("  Max Text Tokens             : {}".format(MAX_TEXT_TOKENS))
+print("  LoRA Only Attention         : {}".format("ON" if LORA_ONLY_ATTN else "OFF"))
+print("  Use Audio Loss              : {}".format("ON" if USE_AUDIO_LOSS else "OFF"))
+print("  Preview Mode                : {}".format(PREVIEW_MODE))
+print("  Preview Compare Base/LoRA   : {}".format("ON" if PREVIEW_COMPARE_BASE else "OFF"))
+print("  Preview Caption Mode        : {}".format(PREVIEW_CAPTION_MODE))
+print("  Preview Custom Prompt       : '{}'".format(PREVIEW_CUSTOM_PROMPT))
+print("  Preview Sample Name         : '{}'".format(PREVIEW_SAMPLE_NAME))
+print("  Preview Every / Steps / CFG : {} / {} / {}".format(PREVIEW_EVERY, PREVIEW_STEPS, PREVIEW_CFG))
+print("  Preview Audio CFG           : {}".format(PREVIEW_AUDIO_CFG))
+print("  Preview Sampler             : {}".format(PREVIEW_SAMPLER))
+print("  Preview LoRA Scale          : {:.2f}".format(PREVIEW_LORA_SCALE))
+print("  Preview CFG clamp / rescale : max={:.1f} / rescale={:.2f}".format(PREVIEW_CFG_MAX, PREVIEW_CFG_RESCALE))
+print("  Preview Recon Sigma         : {:.2f}".format(PREVIEW_RECON_SIGMA))
+print("  Preview Frame Index         : {}".format(PREVIEW_FRAME_INDEX))
+print("  Preview Shift               : {:.2f}".format(PREVIEW_SHIFT))
+print("  Preview VAE FP32            : {}".format("ON" if PREVIEW_VAE_FP32 else "OFF"))
+print("  Preview VAE scaling_factor  : {}".format("ON" if PREVIEW_VAE_USE_SCALING_FACTOR else "OFF"))
+print("  LoRA Key Prefix / Prefijo   : '{}'".format(LORA_KEY_PREFIX))
+print("  Seed Configured / Semilla   : {} ({})".format(SEED, "RANDOM" if SEED <= 0 else "FIXED"))
+print("  Low VRAM 12GB mode          : {}".format("ON" if LOW_VRAM_12GB else "OFF"))
+print("  Activation Offload          : {} (PyTorch save_on_cpu: {})".format(
+    "ON" if ACTIVATION_OFFLOAD else "OFF",
+    "OK" if _SAVE_ON_CPU_AVAILABLE else "NO DISPONIBLE"
+))
+print("  Loss Chunk Elements         : {}".format(LOSS_CHUNK_ELEMENTS))
 print("=" * 80)
 
 
-# ============================================================================
+# ===========================================================================
 # DESCARGA DEL MODELO
-# ============================================================================
-
+# ===========================================================================
 def get_hf_token():
     if os.path.exists("HF_token.json"):
         try:
             with open("HF_token.json", "r", encoding="utf-8") as f:
                 token_data = json.load(f)
-
-            token = token_data.get("token", "").strip()
-
-            if token:
-                return token
-
+                token = token_data.get("token", "").strip()
+                if token:
+                    return token
         except Exception:
             pass
 
     token = os.environ.get("HF_TOKEN", "").strip()
-
     if token:
         return token
 
@@ -271,7 +323,7 @@ def ensure_ltx23_model_downloaded(local_path):
     has_nf4 = os.path.exists(os.path.join(local_path, "index.json"))
 
     if has_base and has_nf4:
-        print(f"[OK] Modelo local encontrado en / Local model found at: {local_path}")
+        print("[OK] Modelo local encontrado en: {}".format(local_path))
         return local_path
 
     print()
@@ -283,7 +335,6 @@ def ensure_ltx23_model_downloaded(local_path):
     print("=" * 80)
 
     auto = os.environ.get("LTX_AUTO_CONFIRM_DOWNLOAD", "0").strip().lower()
-
     if auto not in ("1", "true", "yes", "y", "on"):
         try:
             input("Press Enter to continue / Pulsa Enter para continuar...")
@@ -293,20 +344,16 @@ def ensure_ltx23_model_downloaded(local_path):
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
-        raise ImportError(
-            "huggingface_hub is required. Install with: pip install huggingface_hub"
-        )
+        raise ImportError("huggingface_hub is required. Install with: pip install huggingface_hub")
 
     token = get_hf_token()
-
     if token:
-        print("✓ Using HF Token / Usando token de HF")
+        print("Using HF Token / Usando token de HF")
 
     os.makedirs(local_path, exist_ok=True)
 
     print()
     print("Downloading / Descargando:", HF_BASE_REPO_ID)
-
     snapshot_download(
         repo_id=HF_BASE_REPO_ID,
         local_dir=local_path,
@@ -316,7 +363,6 @@ def ensure_ltx23_model_downloaded(local_path):
 
     print()
     print("Downloading / Descargando:", HF_NF4_REPO_ID)
-
     snapshot_download(
         repo_id=HF_NF4_REPO_ID,
         local_dir=local_path,
@@ -325,15 +371,13 @@ def ensure_ltx23_model_downloaded(local_path):
     )
 
     print()
-    print(f"[OK] Modelo descargado en / Model downloaded to: {local_path}")
-
+    print("[OK] Modelo descargado en: {}".format(local_path))
     return local_path
 
 
-# ============================================================================
+# ===========================================================================
 # UTILIDADES
-# ============================================================================
-
+# ===========================================================================
 def free_vram(*objects):
     for obj in objects:
         try:
@@ -345,7 +389,6 @@ def free_vram(*objects):
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
         try:
             torch.cuda.ipc_collect()
         except Exception:
@@ -363,39 +406,54 @@ def pin_cpu_tensor(t):
                 return t.pin_memory()
         except Exception:
             pass
-
     return t
 
 
 def get_parent_module(root, name):
     parts = name.split(".")
     parent = root
-
     for part in parts[:-1]:
         parent = getattr(parent, part)
-
     return parent, parts[-1]
 
 
 def _round_to_multiple(x, multiple):
     x = int(x)
     multiple = max(1, int(multiple))
-
     return max(
         multiple,
         ((x + multiple - 1) // multiple) * multiple,
     )
 
 
-# ============================================================================
-# NF4 CACHE
-# ============================================================================
+def filter_forward_kwargs(kwargs, forward_fn):
+    try:
+        signature = inspect.signature(forward_fn)
+    except Exception:
+        return kwargs
 
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in signature.parameters.values()
+    )
+
+    if has_var_keyword:
+        return kwargs
+
+    return {
+        k: v
+        for k, v in kwargs.items()
+        if k in signature.parameters
+    }
+
+
+# ===========================================================================
+# NF4 CACHE
+# ===========================================================================
 def load_nf4_cache_(transformer, cache_dir):
     index_path = os.path.join(cache_dir, "index.json")
-
     if not os.path.exists(index_path):
-        raise FileNotFoundError(f"No existe index.json: {index_path}")
+        raise FileNotFoundError("No existe index.json: {}".format(index_path))
 
     with open(index_path, "r", encoding="utf-8") as f:
         index = json.load(f)
@@ -408,29 +466,26 @@ def load_nf4_cache_(transformer, cache_dir):
 
     for name, info in quantized.items():
         filepath = os.path.join(weights_dir, info["file"])
-
         if not os.path.exists(filepath):
-            raise FileNotFoundError(f"No existe peso NF4: {filepath}")
+            raise FileNotFoundError("No existe peso NF4: {}".format(filepath))
 
         parent, child_name = get_parent_module(transformer, name)
 
         with safe_open(filepath, framework="pt", device="cpu") as f:
             weight_data = f.get_tensor("weight")
-            bias_data = None
 
+            bias_data = None
             if info.get("bias", False):
                 bias_data = f.get_tensor("bias")
 
             qs_dict = {}
-
             for key in f.keys():
                 if key.startswith("quant_state."):
                     qs_dict[key[len("quant_state."):]] = f.get_tensor(key)
 
-        packed_qs = {}
-
-        for key, value in qs_dict.items():
-            packed_qs[key] = value
+            packed_qs = {}
+            for key, value in qs_dict.items():
+                packed_qs[key] = value
 
         new_layer = Linear4bit(
             int(info["in_features"]),
@@ -461,12 +516,14 @@ def load_nf4_cache_(transformer, cache_dir):
 
     for name, info in unquantized.items():
         filepath = os.path.join(weights_dir, info["file"])
+        if not os.path.exists(filepath):
+            raise FileNotFoundError("No existe peso unquantized: {}".format(filepath))
+
         parent, child_name = get_parent_module(transformer, name)
 
         with safe_open(filepath, framework="pt", device="cpu") as f:
             weight = f.get_tensor("weight")
             bias = None
-
             if info.get("bias", False):
                 bias = f.get_tensor("bias")
 
@@ -477,14 +534,12 @@ def load_nf4_cache_(transformer, cache_dir):
         )
 
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
-
         if bias is not None:
             layer.bias = torch.nn.Parameter(bias, requires_grad=False)
 
         setattr(parent, child_name, layer)
 
     verified = 0
-
     for _, module in transformer.named_modules():
         if isinstance(module, Linear4bit):
             if (
@@ -493,21 +548,19 @@ def load_nf4_cache_(transformer, cache_dir):
             ):
                 verified += 1
 
-    print(f"Capas NF4 reconstruidas: {replaced}")
-    print(f"Capas NF4 verificadas: {verified}")
+    print("Capas NF4 reconstruidas: {}".format(replaced))
+    print("Capas NF4 verificadas: {}".format(verified))
 
     if verified != replaced:
         raise RuntimeError("La verificación NF4 no coincide.")
 
     print("[OK] Caché NF4 cargada correctamente.")
-
     return transformer
 
 
-# ============================================================================
+# ===========================================================================
 # LoRA TARGETS
-# ============================================================================
-
+# ===========================================================================
 def discover_lora_targets(transformer):
     targets = []
     only_attn = globals().get("LORA_ONLY_ATTN", True)
@@ -551,7 +604,6 @@ def discover_lora_targets(transformer):
                 "add_v_proj",
                 "to_add_out",
             )
-
             if not any(marker in name for marker in attn_markers):
                 continue
 
@@ -565,13 +617,11 @@ def discover_lora_targets(transformer):
     return targets
 
 
-# ============================================================================
+# ===========================================================================
 # PROMPT / TEXT CONDITIONING
-# ============================================================================
-
+# ===========================================================================
 def load_prompt_structure(cache_dir, prefix):
-    path = os.path.join(cache_dir, f"{prefix}_structure.json")
-
+    path = os.path.join(cache_dir, "{}_structure.json".format(prefix))
     if not os.path.exists(path):
         return None
 
@@ -605,14 +655,12 @@ def flatten_tensors(obj, prefix="root"):
 
     if torch.is_tensor(obj):
         result.append((prefix, obj))
-
     elif isinstance(obj, dict):
         for k, v in obj.items():
-            result.extend(flatten_tensors(v, f"{prefix}.{k}"))
-
+            result.extend(flatten_tensors(v, "{}.{}".format(prefix, k)))
     elif isinstance(obj, (tuple, list)):
         for i, v in enumerate(obj):
-            result.extend(flatten_tensors(v, f"{prefix}.{i}"))
+            result.extend(flatten_tensors(v, "{}.{}".format(prefix, i)))
 
     return result
 
@@ -662,7 +710,6 @@ def valid_token_slice(mask):
         return slice(-valid, None)
 
     idx = torch.nonzero(m, as_tuple=False).reshape(-1)
-
     if idx.numel() == valid and int(idx[-1] - idx[0] + 1) == valid:
         return slice(int(idx[0].item()), int(idx[-1].item()) + 1)
 
@@ -670,11 +717,9 @@ def valid_token_slice(mask):
 
 
 def get_text_cache_paths(cache_dir, base, max_text_tokens):
-    tag = f"mt{int(max_text_tokens or 0)}_reg128_v2"
-
-    video_text_path = os.path.join(cache_dir, f"{base}_video_text_{tag}.pt")
-    audio_text_path = os.path.join(cache_dir, f"{base}_audio_text_{tag}.pt")
-
+    tag = "mt{}_reg128_v2".format(int(max_text_tokens or 0))
+    video_text_path = os.path.join(cache_dir, "{}video_text{}.pt".format(base, tag))
+    audio_text_path = os.path.join(cache_dir, "{}audio_text{}.pt".format(base, tag))
     return video_text_path, audio_text_path
 
 
@@ -685,7 +730,6 @@ def run_text_connectors(prompt_result, connectors, max_text_tokens=0):
     embeds, mask = get_prompt_pair(prompt_result)
 
     embeds = embeds.to("cuda", dtype=torch.bfloat16)
-
     if embeds.ndim == 2:
         embeds = embeds.unsqueeze(0)
 
@@ -724,7 +768,6 @@ def run_text_connectors(prompt_result, connectors, max_text_tokens=0):
             "n_registers",
         ):
             val = getattr(obj, attr, None)
-
             if isinstance(val, int) and val > 0:
                 register_multiple = val
                 break
@@ -763,18 +806,14 @@ def run_text_connectors(prompt_result, connectors, max_text_tokens=0):
             audio_text = out[1]
         else:
             video_text = getattr(out, "video_text", None)
-
             if video_text is None:
                 video_text = getattr(out, "video_embeds", None)
-
             if video_text is None:
                 video_text = getattr(out, "video", None)
 
             audio_text = getattr(out, "audio_text", None)
-
             if audio_text is None:
                 audio_text = getattr(out, "audio_embeds", None)
-
             if audio_text is None:
                 audio_text = getattr(out, "audio", None)
 
@@ -784,13 +823,11 @@ def run_text_connectors(prompt_result, connectors, max_text_tokens=0):
         return video_text, audio_text
 
     sl = valid_token_slice(mask)
-
     if sl is not None:
         embeds = embeds[:, sl, :]
         mask = mask[:, sl]
 
     valid_len = int(embeds.shape[1])
-
     if valid_len <= 0:
         embeds = torch.zeros((1, 1, D), device=embeds.device, dtype=embeds.dtype)
         mask = torch.zeros((1, 1), device=mask.device, dtype=mask.dtype)
@@ -831,18 +868,14 @@ def run_text_connectors(prompt_result, connectors, max_text_tokens=0):
         audio_text = out[1]
     else:
         video_text = getattr(out, "video_text", None)
-
         if video_text is None:
             video_text = getattr(out, "video_embeds", None)
-
         if video_text is None:
             video_text = getattr(out, "video", None)
 
         audio_text = getattr(out, "audio_text", None)
-
         if audio_text is None:
             audio_text = getattr(out, "audio_embeds", None)
-
         if audio_text is None:
             audio_text = getattr(out, "audio", None)
 
@@ -857,7 +890,6 @@ def prepare_text_conditioning(entries, connectors, max_text_tokens=0):
 
     for entry in entries:
         base = entry["name"]
-
         video_text_path, audio_text_path = get_text_cache_paths(
             CACHE_DIR,
             base,
@@ -881,9 +913,9 @@ def prepare_text_conditioning(entries, connectors, max_text_tokens=0):
             raise RuntimeError("Faltan textos precomputados y no hay connectors.")
 
         print()
-        print(f"Precomputando text conditioning para {len(missing)} entradas...")
+        print("Precomputando text conditioning para {} entradas...".format(len(missing)))
 
-        connectors.to("cuda", dtype=torch.bfloat16)
+        connectors.to("cuda")
         connectors.eval()
 
         for param in connectors.parameters():
@@ -893,10 +925,10 @@ def prepare_text_conditioning(entries, connectors, max_text_tokens=0):
             base = entry["name"]
 
             if entry.get("prompt", None) is None:
-                entry["prompt"] = load_prompt_structure(CACHE_DIR, f"{base}_prompt")
+                entry["prompt"] = load_prompt_structure(CACHE_DIR, "{}_prompt".format(base))
 
             if entry.get("prompt", None) is None:
-                raise RuntimeError(f"No hay prompt cacheado para {base}.")
+                raise RuntimeError("No hay prompt cacheado para {}.".format(base))
 
             video_text, audio_text = run_text_connectors(
                 entry["prompt"],
@@ -919,11 +951,9 @@ def prepare_text_conditioning(entries, connectors, max_text_tokens=0):
         entry["video_text"] = pin_cpu_tensor(
             torch.load(entry["_video_text_path"], map_location="cpu", weights_only=True).to(torch.bfloat16)
         )
-
         entry["audio_text"] = pin_cpu_tensor(
             torch.load(entry["_audio_text_path"], map_location="cpu", weights_only=True).to(torch.bfloat16)
         )
-
         entry.pop("prompt", None)
 
 
@@ -964,9 +994,9 @@ def prepare_special_text_conditioning(connectors, max_text_tokens, preview_custo
         print("Precomputando textos especiales para preview:")
 
         for prefix in missing:
-            print(f"  - {prefix}")
+            print("  - {}".format(prefix))
 
-        connectors.to("cuda", dtype=torch.bfloat16)
+        connectors.to("cuda")
         connectors.eval()
 
         for param in connectors.parameters():
@@ -974,7 +1004,6 @@ def prepare_special_text_conditioning(connectors, max_text_tokens, preview_custo
 
         for prefix in missing:
             prompt_result = load_prompt_structure(CACHE_DIR, prefix)
-
             if prompt_result is None:
                 continue
 
@@ -1021,7 +1050,7 @@ def load_cached_entries(cache_dir, audio_channels, max_text_tokens=0):
         base = filename[:-len("_video_latent.pt")]
 
         video_path = os.path.join(cache_dir, filename)
-        audio_path = os.path.join(cache_dir, f"{base}_audio_latent.pt")
+        audio_path = os.path.join(cache_dir, "{}_audio_latent.pt".format(base))
 
         if not os.path.exists(audio_path):
             continue
@@ -1038,13 +1067,11 @@ def load_cached_entries(cache_dir, audio_channels, max_text_tokens=0):
             os.path.exists(video_text_path)
             and os.path.exists(audio_text_path)
         ):
-            prompt_result = load_prompt_structure(cache_dir, f"{base}_prompt")
-
+            prompt_result = load_prompt_structure(cache_dir, "{}_prompt".format(base))
             if prompt_result is None:
                 continue
 
         video_latent = torch.load(video_path, map_location="cpu", weights_only=True)
-
         if video_latent is None:
             continue
 
@@ -1053,8 +1080,13 @@ def load_cached_entries(cache_dir, audio_channels, max_text_tokens=0):
         audio_latent_raw = torch.load(audio_path, map_location="cpu", weights_only=True)
 
         if audio_latent_raw is None:
+            if video_latent.ndim == 5:
+                bsz = video_latent.shape[0]
+            else:
+                bsz = 1
+
             audio_latent = torch.zeros(
-                (video_latent.shape[0], audio_channels, 1),
+                (bsz, audio_channels, 1),
                 dtype=torch.bfloat16,
             )
         else:
@@ -1079,10 +1111,9 @@ def load_cached_entries(cache_dir, audio_channels, max_text_tokens=0):
     return entries
 
 
-# ============================================================================
+# ===========================================================================
 # PATCHIFY / TIMESTEP / LOSS
-# ============================================================================
-
+# ===========================================================================
 def patch_video_latent(latent, patch_size=1, patch_size_t=1):
     if latent.ndim != 5:
         raise RuntimeError("Video latent esperado [B,C,F,H,W].")
@@ -1115,7 +1146,6 @@ def patch_video_latent(latent, patch_size=1, patch_size_t=1):
     )
 
     x = x.permute(0, 2, 4, 6, 1, 3, 5, 7)
-
     return x.reshape(B, -1, C * patch_size_t * patch_size * patch_size)
 
 
@@ -1149,6 +1179,22 @@ def unpack_video_latent(tokens, latent_shape, patch_size=1, patch_size_t=1):
     return x.reshape(B, C, Fp * pt, Hp * p, Wp * p)
 
 
+def align_video_latent_to_patch(latent, patch_size=1, patch_size_t=1):
+    if latent.ndim != 5:
+        return latent
+
+    B, C, Fm, H, W = latent.shape
+
+    patch_size = max(1, int(patch_size))
+    patch_size_t = max(1, int(patch_size_t))
+
+    Fm = (Fm // patch_size_t) * patch_size_t
+    H = (H // patch_size) * patch_size
+    W = (W // patch_size) * patch_size
+
+    return latent[:, :, :Fm, :H, :W].contiguous()
+
+
 def make_video_timestep(sigma, seq_len, device, dtype):
     multiplier = float(getattr(CURRENT_CONFIG, "timestep_scale_multiplier", 1000))
 
@@ -1159,7 +1205,12 @@ def make_video_timestep(sigma, seq_len, device, dtype):
     ).to(device=device, dtype=dtype)
 
 
-def mse_loss_chunked(pred, target, chunk_elements=2_000_000):
+def mse_loss_chunked(pred, target, chunk_elements=None):
+    if chunk_elements is None:
+        chunk_elements = int(globals().get("LOSS_CHUNK_ELEMENTS", 2000000))
+
+    chunk_elements = max(64, int(chunk_elements))
+
     if pred.numel() == 0:
         return pred.new_zeros((), dtype=torch.float32)
 
@@ -1170,7 +1221,6 @@ def mse_loss_chunked(pred, target, chunk_elements=2_000_000):
     target_flat = target.reshape(-1)
 
     n = pred_flat.numel()
-
     loss_sum = torch.zeros((), device=pred.device, dtype=torch.float32)
 
     for start in range(0, n, chunk_elements):
@@ -1186,10 +1236,9 @@ def mse_loss_chunked(pred, target, chunk_elements=2_000_000):
     return loss_sum / float(n)
 
 
-# ============================================================================
+# ===========================================================================
 # OPTIMIZACIONES
-# ============================================================================
-
+# ===========================================================================
 def enable_memory_efficient_attention(transformer):
     try:
         transformer.enable_xformers_memory_efficient_attention()
@@ -1234,31 +1283,85 @@ def cast_frozen_to_bf16(root):
     for name, buf in root.named_buffers():
         if buf.is_floating_point() and buf.dtype != torch.bfloat16:
             lower = name.lower()
-
             if any(k in lower for k in ("norm", "ln", "layernorm")):
                 continue
-
             buf.data = buf.data.to(torch.bfloat16)
 
 
-# ============================================================================
-# EXPORT LoRA (formato estándar ComfyUI / Civitai)
-# ============================================================================
+# ===========================================================================
+# PREVIEW: ESCALADO TEMPORAL DEL LoRA
+# ===========================================================================
+def _iter_lora_layers(model):
+    for m in model.modules():
+        if hasattr(m, "lora_A") and hasattr(m, "lora_B"):
+            yield m
 
+
+def apply_preview_lora_scale(model, factor):
+    factor = float(factor)
+
+    if abs(factor - 1.0) < 1e-9:
+        return False
+
+    saved = []
+
+    for m in _iter_lora_layers(model):
+        sc = getattr(m, "scaling", None)
+
+        if isinstance(sc, dict):
+            saved.append((m, {k: sc[k] for k in sc}))
+
+            for k in sc:
+                try:
+                    sc[k] = float(sc[k]) * factor
+                except Exception:
+                    pass
+
+        elif isinstance(sc, (int, float)):
+            saved.append((m, sc))
+
+            try:
+                m.scaling = float(sc) * factor
+            except Exception:
+                pass
+
+    if saved:
+        model._preview_lora_saved = saved
+        return True
+
+    return False
+
+
+def restore_preview_lora_scale(model):
+    saved = getattr(model, "_preview_lora_saved", None)
+    if not saved:
+        return
+
+    for m, orig in saved:
+        try:
+            sc = getattr(m, "scaling", None)
+
+            if isinstance(orig, dict) and isinstance(sc, dict):
+                for k, v in orig.items():
+                    sc[k] = v
+            else:
+                m.scaling = orig
+        except Exception:
+            pass
+
+    try:
+        del model._preview_lora_saved
+    except Exception:
+        pass
+
+
+# ===========================================================================
+# EXPORT LoRA
+# ===========================================================================
 def save_lora(model, path, prefix=None):
-    """
-    Exporta el LoRA en formato estándar ComfyUI / Civitai:
-      - prefijo configurable (default 'diffusion_model.'),
-      - SIN el token '.default' del adapter de PEFT,
-      - scaling (alpha/rank) 'horneado' en lora_B para que strength=1.0
-        en ComfyUI reproduzca EXACTAMENTE el entrenamiento
-        (ni el loader nativo ni los hooks de inyección aplican alpha/rank).
-
-    Antes se guardaba 'transformer.X.lora_A.default.weight' y ComfyUI
-    no encontraba NINGUNA key -> 'lora key not loaded' en todas.
-    """
     if prefix is None:
         prefix = LORA_KEY_PREFIX
+
     if prefix is None:
         prefix = ""
 
@@ -1270,13 +1373,14 @@ def save_lora(model, path, prefix=None):
         if "lora_" not in name:
             continue
 
-        # base_model.model.transformer_blocks.0.attn1.to_q.lora_A.default.weight
         clean = name.replace("base_model.model.", "")
-        clean = clean.replace(".default.", ".")          # quita adapter PEFT
+        clean = clean.replace(".default.", ".")
 
         t = tensor.detach().to(torch.float32).cpu()
-        if ".lora_B." in clean:                          # hornea el scaling
+
+        if ".lora_B." in clean:
             t = t * scaling
+
         t = t.to(torch.bfloat16).contiguous()
 
         state[prefix + clean] = t
@@ -1287,21 +1391,23 @@ def save_lora(model, path, prefix=None):
         metadata={
             "format": "ltx23_lora",
             "lora_key_prefix": prefix,
-            "baked_scaling": f"{scaling:.6f}",
+            "baked_scaling": "{:.6f}".format(scaling),
         },
     )
 
 
-# ============================================================================
+# ===========================================================================
 # PREVIEW
-# ============================================================================
-
+# ===========================================================================
 class LTXVaeHolder:
     vae = None
 
     @classmethod
     def get(cls):
         if cls.vae is None:
+            use_fp32 = globals().get("PREVIEW_VAE_FP32", True)
+            dtype = torch.float32 if use_fp32 else torch.bfloat16
+
             pipe = DiffusionPipeline.from_pretrained(
                 MODEL_ID,
                 transformer=None,
@@ -1310,7 +1416,7 @@ class LTXVaeHolder:
                 tokenizer=None,
                 processor=None,
                 vocoder=None,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=dtype,
                 low_cpu_mem_usage=True,
             )
 
@@ -1336,15 +1442,16 @@ def set_scheduler_timesteps_for_preview(scheduler, steps, seq_len, device):
 
         if "mu" in sig.parameters:
             base_seq = float(getattr(scheduler.config, "base_image_seq_len", 256))
-            max_seq = float(getattr(scheduler.config, "max_image_seq_len", 6400))
+            max_seq = float(getattr(scheduler.config, "max_image_seq_len", 4096))
             base_shift = float(getattr(scheduler.config, "base_shift", 0.5))
             max_shift = float(getattr(scheduler.config, "max_shift", 1.15))
 
             if max_seq > base_seq:
                 m = (max_shift - base_shift) / (max_seq - base_seq)
                 b = base_shift - m * base_seq
-                kwargs["mu"] = float(seq_len) * m + b
-
+                mu = float(seq_len) * m + b
+                mu = min(max(mu, base_shift), max_shift)
+                kwargs["mu"] = mu
     except Exception:
         pass
 
@@ -1415,67 +1522,140 @@ def preview_forward(
     }
 
     if CURRENT_TRANSFORMER is not None:
-        signature = inspect.signature(CURRENT_TRANSFORMER.forward)
+        forward_kwargs = filter_forward_kwargs(forward_kwargs, CURRENT_TRANSFORMER.forward)
     else:
-        signature = inspect.signature(model.forward)
-
-    forward_kwargs = {
-        k: v
-        for k, v in forward_kwargs.items()
-        if k in signature.parameters
-    }
+        forward_kwargs = filter_forward_kwargs(forward_kwargs, model.forward)
 
     output = model(**forward_kwargs)
 
     if isinstance(output, tuple):
         if len(output) == 0:
-            raise RuntimeError("Preview: forward devolvió tuple vacía.")
+            raise RuntimeError("Preview: forward devolvió tupla vacía.")
 
         pred_video = output[0]
-
+        pred_audio = output[1] if len(output) > 1 else None
     else:
         pred_video = getattr(output, "video", None)
-
         if pred_video is None:
             pred_video = getattr(output, "sample", None)
 
+        pred_audio = getattr(output, "audio", None)
+        if pred_audio is None:
+            pred_audio = getattr(output, "audio_sample", None)
+
     if pred_video is None:
-        raise RuntimeError("Preview: no se pudo obtener predicción de vídeo.")
+        raise RuntimeError("Preview: no se pudo obtener predicción de video.")
 
-    return pred_video
+    if pred_audio is None:
+        pred_audio = torch.zeros_like(audio_tokens)
+
+    return pred_video, pred_audio
 
 
-def decode_preview_latent(vae, latent):
-    latent = latent.detach().to("cuda", dtype=vae.dtype)
+def _rescale_guidance(guided, cond, rescale):
+    if rescale <= 0.0:
+        return guided
 
-    # IMPORTANTE: latents_mean/latents_std son BUFFERS del propio VAE
-    # (vae.latents_mean / vae.latents_std), NO viven en vae.config.
-    # El check anterior (hasattr(vae.config, "latents_mean")) nunca
-    # era verdadero, así que la desnormalización real nunca se
-    # aplicaba (y el toggle PREVIEW_VAE_INVERSE_SCALE tampoco ayudaba,
-    # porque además faltaba dividir por scaling_factor). Se aplica
-    # aquí SIEMPRE, igual que hace el pipeline oficial al decodificar:
-    #
-    #   latents = latents * latents_std / scaling_factor + latents_mean
-    #
-    # (ver diffusers/pipelines/ltx2/pipeline_ltx2.py: _denormalize_latents).
-    latents_mean = vae.latents_mean.to(
-        device=latent.device, dtype=latent.dtype
-    ).view(1, -1, 1, 1, 1)
+    dims = list(range(1, cond.ndim))
 
-    latents_std = vae.latents_std.to(
-        device=latent.device, dtype=latent.dtype
-    ).view(1, -1, 1, 1, 1)
+    std_cond = cond.std(dim=dims, keepdim=True).clamp_min(1e-6)
+    std_guided = guided.std(dim=dims, keepdim=True).clamp_min(1e-6)
 
-    scaling_factor = float(getattr(vae.config, "scaling_factor", 1.0))
+    rescaled = guided * (std_cond / std_guided)
 
-    latent = latent * latents_std / scaling_factor + latents_mean
+    return rescale * rescaled + (1.0 - rescale) * guided
 
-    with torch.inference_mode():
+
+def predict_velocity_cfg(
+    model,
+    video_tokens,
+    audio_tokens,
+    video_text,
+    audio_text,
+    neg_video_text,
+    neg_audio_text,
+    t_val,
+    latent_shape,
+    audio_channels,
+    cfg,
+    rescale,
+    cfg_audio=None,
+):
+    if cfg_audio is None:
+        cfg_audio = cfg
+
+    cond_v, cond_a = preview_forward(
+        model,
+        video_tokens,
+        audio_tokens,
+        video_text,
+        audio_text,
+        t_val,
+        latent_shape,
+        audio_channels,
+    )
+
+    if cfg <= 1.0 or neg_video_text is None:
+        return cond_v, cond_a
+
+    uncond_v, uncond_a = preview_forward(
+        model,
+        video_tokens,
+        audio_tokens,
+        neg_video_text,
+        neg_audio_text,
+        t_val,
+        latent_shape,
+        audio_channels,
+    )
+
+    guided_v = uncond_v + float(cfg) * (cond_v - uncond_v)
+    guided_a = uncond_a + float(cfg_audio) * (cond_a - uncond_a)
+
+    guided_v = _rescale_guidance(guided_v, cond_v, rescale)
+
+    if float(cfg_audio) > 1.0 and rescale > 0.0:
+        guided_a = _rescale_guidance(guided_a, cond_a, rescale)
+
+    return guided_v, guided_a
+
+
+def decode_preview_latent(vae, latent, frame_index=-1):
+    dtype = next(vae.parameters()).dtype
+    latent = latent.detach().to("cuda", dtype=dtype)
+
+    if getattr(vae, "latents_mean", None) is not None and getattr(vae, "latents_std", None) is not None:
+        latents_mean = torch.as_tensor(
+            vae.latents_mean,
+            device=latent.device,
+            dtype=dtype,
+        ).view(1, -1, 1, 1, 1)
+
+        latents_std = torch.as_tensor(
+            vae.latents_std,
+            device=latent.device,
+            dtype=dtype,
+        ).view(1, -1, 1, 1, 1)
+
+        scaling_factor = float(getattr(vae.config, "scaling_factor", 1.0))
+
+        if PREVIEW_VAE_USE_SCALING_FACTOR and abs(scaling_factor) > 1e-12:
+            latent = latent * latents_std / scaling_factor + latents_mean
+        else:
+            latent = latent * latents_std + latents_mean
+
+    with torch.no_grad():
         decoded = vae.decode(latent, return_dict=False)[0]
 
     if decoded.ndim == 5:
-        decoded = decoded[:, :, 0]
+        f = decoded.shape[2]
+
+        if frame_index < 0:
+            idx = f // 2
+        else:
+            idx = min(frame_index, f - 1)
+
+        decoded = decoded[:, :, idx]
 
     decoded = decoded[:, :3].detach().float()
 
@@ -1491,7 +1671,369 @@ def decode_preview_latent(vae, latent):
     return img
 
 
-def run_preview_ltx(
+def make_preview_sigmas(steps, sigma_start=1.0, shift=1.0, device="cuda"):
+    steps = max(1, int(steps))
+    sigma_start = float(sigma_start)
+    shift = float(shift)
+
+    base = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
+
+    if abs(shift - 1.0) > 1e-6:
+        base = shift * base / (1.0 + (shift - 1.0) * base)
+
+    sigmas = sigma_start * base
+    sigmas[0] = sigma_start
+    sigmas[-1] = 0.0
+
+    return sigmas
+
+
+def prepare_preview_tensors(entry, device):
+    video = entry["video"].to(device, dtype=torch.bfloat16, non_blocking=True)
+    if video.ndim == 4:
+        video = video.unsqueeze(0)
+    video = video[:1].contiguous()
+
+    audio = entry["audio"].to(device, dtype=torch.bfloat16, non_blocking=True)
+    if audio.ndim == 2:
+        audio = audio.unsqueeze(0)
+    audio = audio[:1].contiguous()
+
+    return video, audio
+
+
+def run_onestep_x0_preview(
+    model,
+    video_clean,
+    audio_clean,
+    video_text,
+    audio_text,
+    neg_video_text,
+    neg_audio_text,
+    audio_channels,
+    patch_size,
+    patch_size_t,
+    device,
+    sigma_start,
+    cfg,
+    rescale,
+    cfg_audio,
+    seed,
+):
+    latent_shape = tuple(video_clean.shape)
+
+    v0 = patch_video_latent(video_clean, patch_size, patch_size_t)
+    a0 = patch_audio_latent(audio_clean)
+
+    g = torch.Generator(device=device).manual_seed(int(seed))
+
+    noise_v = torch.randn(v0.shape, generator=g, device=device, dtype=v0.dtype)
+    noise_a = torch.randn(a0.shape, generator=g, device=device, dtype=a0.dtype)
+
+    s = float(sigma_start)
+
+    vx = (1.0 - s) * v0 + s * noise_v
+    ax = (1.0 - s) * a0 + s * noise_a
+
+    t_val = s * 1000.0
+
+    with torch.no_grad():
+        vel_v, vel_a = predict_velocity_cfg(
+            model,
+            vx,
+            ax,
+            video_text,
+            audio_text,
+            neg_video_text,
+            neg_audio_text,
+            t_val,
+            latent_shape,
+            audio_channels,
+            cfg,
+            rescale,
+            cfg_audio,
+        )
+
+        x0_tokens = vx - s * vel_v
+
+    latents = unpack_video_latent(
+        x0_tokens,
+        latent_shape,
+        patch_size,
+        patch_size_t,
+    )
+
+    return latents.detach()
+
+
+def run_recon_flow_preview(
+    model,
+    video_clean,
+    audio_clean,
+    video_text,
+    audio_text,
+    neg_video_text,
+    neg_audio_text,
+    audio_channels,
+    patch_size,
+    patch_size_t,
+    device,
+    steps,
+    cfg,
+    rescale,
+    cfg_audio,
+    sigma_start,
+    shift,
+    seed,
+):
+    latent_shape = tuple(video_clean.shape)
+
+    v0 = patch_video_latent(video_clean, patch_size, patch_size_t)
+    a0 = patch_audio_latent(audio_clean)
+
+    g = torch.Generator(device=device).manual_seed(int(seed))
+
+    noise_v = torch.randn(v0.shape, generator=g, device=device, dtype=v0.dtype)
+    noise_a = torch.randn(a0.shape, generator=g, device=device, dtype=a0.dtype)
+
+    s0 = float(sigma_start)
+
+    vx = (1.0 - s0) * v0 + s0 * noise_v
+    ax = (1.0 - s0) * a0 + s0 * noise_a
+
+    sigmas = make_preview_sigmas(
+        steps=steps,
+        sigma_start=s0,
+        shift=shift,
+        device=device,
+    )
+
+    with torch.no_grad():
+        for i in range(sigmas.numel() - 1):
+            s_cur = float(sigmas[i].item())
+            s_next = float(sigmas[i + 1].item())
+
+            if s_cur <= 0.0:
+                break
+
+            t_val = s_cur * 1000.0
+
+            vel_v, vel_a = predict_velocity_cfg(
+                model,
+                vx,
+                ax,
+                video_text,
+                audio_text,
+                neg_video_text,
+                neg_audio_text,
+                t_val,
+                latent_shape,
+                audio_channels,
+                cfg,
+                rescale,
+                cfg_audio,
+            )
+
+            d_sigma = s_next - s_cur
+
+            vx = vx + d_sigma * vel_v
+            ax = ax + d_sigma * vel_a
+
+    latents = unpack_video_latent(
+        vx,
+        latent_shape,
+        patch_size,
+        patch_size_t,
+    )
+
+    return latents.detach()
+
+
+def run_fullgen_flow_preview(
+    model,
+    video_ref,
+    audio_ref,
+    video_text,
+    audio_text,
+    neg_video_text,
+    neg_audio_text,
+    audio_channels,
+    patch_size,
+    patch_size_t,
+    device,
+    steps,
+    cfg,
+    rescale,
+    cfg_audio,
+    shift,
+    seed,
+):
+    latent_shape = tuple(video_ref.shape)
+
+    v_ref = patch_video_latent(video_ref, patch_size, patch_size_t)
+    a_ref = patch_audio_latent(audio_ref)
+
+    g = torch.Generator(device=device).manual_seed(int(seed))
+
+    vx = torch.randn(v_ref.shape, generator=g, device=device, dtype=v_ref.dtype)
+    ax = torch.randn(a_ref.shape, generator=g, device=device, dtype=a_ref.dtype)
+
+    sigmas = make_preview_sigmas(
+        steps=steps,
+        sigma_start=1.0,
+        shift=shift,
+        device=device,
+    )
+
+    with torch.no_grad():
+        for i in range(sigmas.numel() - 1):
+            s_cur = float(sigmas[i].item())
+            s_next = float(sigmas[i + 1].item())
+
+            if s_cur <= 0.0:
+                break
+
+            t_val = s_cur * 1000.0
+
+            vel_v, vel_a = predict_velocity_cfg(
+                model,
+                vx,
+                ax,
+                video_text,
+                audio_text,
+                neg_video_text,
+                neg_audio_text,
+                t_val,
+                latent_shape,
+                audio_channels,
+                cfg,
+                rescale,
+                cfg_audio,
+            )
+
+            d_sigma = s_next - s_cur
+
+            vx = vx + d_sigma * vel_v
+            ax = ax + d_sigma * vel_a
+
+    latents = unpack_video_latent(
+        vx,
+        latent_shape,
+        patch_size,
+        patch_size_t,
+    )
+
+    return latents.detach()
+
+
+def reload_preview_settings():
+    global PREVIEW_EVERY, PREVIEW_STEPS, PREVIEW_CFG, PREVIEW_SAMPLER
+    global PREVIEW_LORA_SCALE, PREVIEW_CFG_MAX, PREVIEW_CFG_RESCALE
+    global PREVIEW_CAPTION_MODE, PREVIEW_CUSTOM_PROMPT
+    global PREVIEW_MODE, PREVIEW_RECON_SIGMA, PREVIEW_FRAME_INDEX
+    global PREVIEW_SHIFT, PREVIEW_VAE_FP32, PREVIEW_AUDIO_CFG
+    global PREVIEW_SAMPLE_NAME, PREVIEW_VAE_USE_SCALING_FACTOR
+    global PREVIEW_COMPARE_BASE
+    global SEED
+
+    try:
+        if not os.path.exists(CONFIG_PATH):
+            return
+
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            pcfg = json.load(f)
+
+        if not isinstance(pcfg, dict):
+            return
+
+        def g(key, default):
+            if key in pcfg:
+                return pcfg[key]
+            if (key + " ") in pcfg:
+                return pcfg[key + " "]
+            return default
+
+        def gb(key, default):
+            v = g(key, default)
+
+            if isinstance(v, bool):
+                return v
+
+            if isinstance(v, (int, float)):
+                return bool(v)
+
+            if isinstance(v, str):
+                return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+            return bool(v)
+
+        PREVIEW_EVERY = int(g("preview_every", PREVIEW_EVERY))
+        PREVIEW_STEPS = int(g("preview_steps", PREVIEW_STEPS))
+        PREVIEW_CFG = float(g("preview_cfg", PREVIEW_CFG))
+        PREVIEW_SAMPLER = str(g("preview_sampler", PREVIEW_SAMPLER)).strip().lower()
+
+        PREVIEW_LORA_SCALE = float(g("preview_lora_scale", PREVIEW_LORA_SCALE))
+        PREVIEW_CFG_MAX = float(g("preview_cfg_max", PREVIEW_CFG_MAX))
+        PREVIEW_CFG_RESCALE = float(g("preview_cfg_rescale", PREVIEW_CFG_RESCALE))
+
+        PREVIEW_CAPTION_MODE = str(g("preview_caption_mode", PREVIEW_CAPTION_MODE)).strip().lower()
+        PREVIEW_CUSTOM_PROMPT = str(g("preview_custom_prompt", PREVIEW_CUSTOM_PROMPT)).strip()
+
+        PREVIEW_MODE = str(g("preview_mode", PREVIEW_MODE)).strip().lower()
+        PREVIEW_RECON_SIGMA = float(g("preview_recon_sigma", PREVIEW_RECON_SIGMA))
+        PREVIEW_FRAME_INDEX = int(g("preview_frame_index", PREVIEW_FRAME_INDEX))
+        PREVIEW_SHIFT = float(g("preview_shift", PREVIEW_SHIFT))
+        PREVIEW_VAE_FP32 = gb("preview_vae_fp32", PREVIEW_VAE_FP32)
+        PREVIEW_AUDIO_CFG = float(g("preview_audio_cfg", PREVIEW_AUDIO_CFG))
+        PREVIEW_SAMPLE_NAME = str(g("preview_sample_name", PREVIEW_SAMPLE_NAME)).strip()
+        PREVIEW_VAE_USE_SCALING_FACTOR = gb("preview_vae_use_scaling_factor", PREVIEW_VAE_USE_SCALING_FACTOR)
+        PREVIEW_COMPARE_BASE = gb("preview_compare_base", PREVIEW_COMPARE_BASE)
+
+        if PREVIEW_MODE not in ("gen", "recon", "onestep"):
+            PREVIEW_MODE = "gen"
+
+        SEED = int(g("seed", SEED))
+
+    except Exception as e:
+        print("  [reload] No se pudo releer {} ({}); se mantiene la receta anterior.".format(
+            CONFIG_PATH, e
+        ))
+
+
+def _fmt_num(x):
+    try:
+        f = float(x)
+    except Exception:
+        return str(x)
+
+    if abs(f - round(f)) < 1e-9:
+        return str(int(round(f)))
+
+    return ("{:.2f}".format(f)).rstrip("0").rstrip(".").replace(".", "p")
+
+
+def preview_filename(step):
+    parts = [
+        "preview_step_{:05d}".format(int(step)),
+        str(PREVIEW_MODE or "gen"),
+    ]
+
+    if PREVIEW_MODE != "gen":
+        parts.append("sig{}".format(_fmt_num(PREVIEW_RECON_SIGMA)))
+
+    parts.extend([
+        "{}st".format(int(PREVIEW_STEPS)),
+        "cfg{}".format(_fmt_num(PREVIEW_CFG)),
+        "acfg{}".format(_fmt_num(PREVIEW_AUDIO_CFG)),
+    ])
+
+    if abs(float(PREVIEW_LORA_SCALE) - 1.0) > 1e-6:
+        parts.append("ls{}".format(_fmt_num(PREVIEW_LORA_SCALE)))
+
+    return "_".join(parts) + ".png"
+
+
+def run_preview_diagnostic(
     model,
     scheduler,
     entries,
@@ -1499,8 +2041,13 @@ def run_preview_ltx(
     step,
     audio_channels,
 ):
-    if scheduler is None or not entries:
+    if not entries:
         return
+
+    if special_texts is None:
+        special_texts = {}
+
+    reload_preview_settings()
 
     was_training = model.training
     model.eval()
@@ -1509,17 +2056,17 @@ def run_preview_ltx(
 
     try:
         valid_entries = [e for e in entries if not e["name"].startswith("_")]
-
         if not valid_entries:
             valid_entries = entries
 
-        if PREVIEW_CAPTION_MODE == "random":
+        if PREVIEW_SAMPLE_NAME:
+            candidates = [e for e in valid_entries if e["name"] == PREVIEW_SAMPLE_NAME]
+            entry = candidates[0] if candidates else valid_entries[0]
+        elif PREVIEW_CAPTION_MODE == "random":
             entry = random.choice(valid_entries)
-
         elif PREVIEW_CAPTION_MODE == "rotate4":
             idx = (step // max(1, PREVIEW_EVERY)) % min(4, len(valid_entries))
             entry = valid_entries[idx]
-
         else:
             entry = valid_entries[0]
 
@@ -1531,10 +2078,13 @@ def run_preview_ltx(
             audio_text = entry["audio_text"]
             sample_name = entry["name"]
 
-        latent_shape = tuple(entry["video"].shape)
-        latent_shape = (1,) + latent_shape[1:]
-
         device = "cuda"
+
+        patch_size = int(getattr(CURRENT_CONFIG, "patch_size", 1))
+        patch_size_t = int(getattr(CURRENT_CONFIG, "patch_size_t", 1))
+
+        video_clean, audio_clean = prepare_preview_tensors(entry, device)
+        video_clean = align_video_latent_to_patch(video_clean, patch_size, patch_size_t)
 
         video_text = video_text.to(device, dtype=torch.bfloat16)
         audio_text = audio_text.to(device, dtype=torch.bfloat16)
@@ -1545,10 +2095,13 @@ def run_preview_ltx(
         if audio_text.ndim == 2:
             audio_text = audio_text.unsqueeze(0)
 
+        eff_cfg = min(float(PREVIEW_CFG), float(PREVIEW_CFG_MAX))
+        eff_audio_cfg = float(PREVIEW_AUDIO_CFG)
+
         neg_video_text = None
         neg_audio_text = None
 
-        if PREVIEW_CFG > 1.0 and "_neg" in special_texts:
+        if eff_cfg > 1.0 and "_neg" in special_texts:
             neg_video_text, neg_audio_text = special_texts["_neg"]
 
             neg_video_text = neg_video_text.to(device, dtype=torch.bfloat16)
@@ -1559,111 +2112,172 @@ def run_preview_ltx(
 
             if neg_audio_text.ndim == 2:
                 neg_audio_text = neg_audio_text.unsqueeze(0)
+        else:
+            eff_cfg = 1.0
+            eff_audio_cfg = 1.0
 
         if SEED > 0:
             preview_seed = SEED
         else:
             preview_seed = random.randint(1, 2147483647)
 
+        sigma_start = min(max(float(PREVIEW_RECON_SIGMA), 0.05), 1.0)
+        shift = max(0.1, float(PREVIEW_SHIFT))
+
         print()
-        print(f"  [Preview] Mode: {PREVIEW_CAPTION_MODE} | Sample: {sample_name}")
-        print(f"  ↳ Preview Seed used / Semilla utilizada: {preview_seed}")
-        print(f"  ↳ Preview Steps / Pasos: {PREVIEW_STEPS}")
-        print(f"  ↳ Preview CFG: {PREVIEW_CFG}")
+        print("  [Preview-Diag] Mode: {} | Sample: {}".format(PREVIEW_MODE, sample_name))
+        print("  -> Seed: {}".format(preview_seed))
+        print("  -> Steps: {}".format(PREVIEW_STEPS))
+        print("  -> CFG video/audio: {:.2f} / {:.2f}".format(eff_cfg, eff_audio_cfg))
+        print("  -> CFG rescale: {:.2f}".format(PREVIEW_CFG_RESCALE))
+        print("  -> LoRA scale: {:.2f}".format(PREVIEW_LORA_SCALE))
+        print("  -> Shift: {:.2f}".format(shift))
+        print("  -> Negative active: {}".format(neg_video_text is not None))
+        print("  -> Compare BASE vs LoRA: {}".format("ON" if PREVIEW_COMPARE_BASE else "OFF"))
 
-        generator = torch.Generator(device=device).manual_seed(preview_seed)
+        if PREVIEW_MODE != "gen":
+            print("  -> Recon sigma: {:.2f}".format(sigma_start))
 
-        latents = torch.randn(
-            latent_shape,
-            generator=generator,
-            device=device,
-            dtype=torch.bfloat16,
-        )
+        def _run_mode(scale_factor):
+            applied_local = False
 
-        if hasattr(scheduler, "init_noise_sigma"):
-            latents = latents * scheduler.init_noise_sigma
+            try:
+                if abs(float(scale_factor) - 1.0) > 1e-6:
+                    applied_local = apply_preview_lora_scale(model, float(scale_factor))
 
-        audio_latent = torch.zeros(
-            (1, int(audio_channels), 1),
-            device=device,
-            dtype=torch.bfloat16,
-        )
+                    if applied_local:
+                        print("  -> Preview LoRA scale temporal: {:.2f}".format(float(scale_factor)))
 
-        patch_size = int(getattr(CURRENT_CONFIG, "patch_size", 1))
-        patch_size_t = int(getattr(CURRENT_CONFIG, "patch_size_t", 1))
-
-        video_tokens = patch_video_latent(latents, patch_size, patch_size_t)
-        seq_len = video_tokens.shape[1]
-
-        set_scheduler_timesteps_for_preview(scheduler, PREVIEW_STEPS, seq_len, device)
-
-        if len(scheduler.timesteps) == 0:
-            return
-
-        with torch.inference_mode():
-            for t in scheduler.timesteps:
-                video_tokens = patch_video_latent(latents, patch_size, patch_size_t)
-                audio_tokens = patch_audio_latent(audio_latent)
-
-                pred_video = preview_forward(
-                    model,
-                    video_tokens,
-                    audio_tokens,
-                    video_text,
-                    audio_text,
-                    t,
-                    latent_shape,
-                    audio_channels,
-                )
-
-                if neg_video_text is not None:
-                    pred_neg = preview_forward(
-                        model,
-                        video_tokens,
-                        audio_tokens,
-                        neg_video_text,
-                        neg_audio_text,
-                        t,
-                        latent_shape,
-                        audio_channels,
+                if PREVIEW_MODE == "onestep":
+                    return run_onestep_x0_preview(
+                        model=model,
+                        video_clean=video_clean,
+                        audio_clean=audio_clean,
+                        video_text=video_text,
+                        audio_text=audio_text,
+                        neg_video_text=neg_video_text,
+                        neg_audio_text=neg_audio_text,
+                        audio_channels=audio_channels,
+                        patch_size=patch_size,
+                        patch_size_t=patch_size_t,
+                        device=device,
+                        sigma_start=sigma_start,
+                        cfg=eff_cfg,
+                        rescale=PREVIEW_CFG_RESCALE,
+                        cfg_audio=eff_audio_cfg,
+                        seed=preview_seed,
                     )
 
-                    pred_video = pred_neg + PREVIEW_CFG * (pred_video - pred_neg)
+                elif PREVIEW_MODE == "recon":
+                    return run_recon_flow_preview(
+                        model=model,
+                        video_clean=video_clean,
+                        audio_clean=audio_clean,
+                        video_text=video_text,
+                        audio_text=audio_text,
+                        neg_video_text=neg_video_text,
+                        neg_audio_text=neg_audio_text,
+                        audio_channels=audio_channels,
+                        patch_size=patch_size,
+                        patch_size_t=patch_size_t,
+                        device=device,
+                        steps=PREVIEW_STEPS,
+                        cfg=eff_cfg,
+                        rescale=PREVIEW_CFG_RESCALE,
+                        cfg_audio=eff_audio_cfg,
+                        sigma_start=sigma_start,
+                        shift=shift,
+                        seed=preview_seed,
+                    )
 
-                step_result = scheduler.step(
-                    pred_video.to(torch.float32),
-                    t,
-                    video_tokens.to(torch.float32),
-                    return_dict=False,
+                else:
+                    return run_fullgen_flow_preview(
+                        model=model,
+                        video_ref=video_clean,
+                        audio_ref=audio_clean,
+                        video_text=video_text,
+                        audio_text=audio_text,
+                        neg_video_text=neg_video_text,
+                        neg_audio_text=neg_audio_text,
+                        audio_channels=audio_channels,
+                        patch_size=patch_size,
+                        patch_size_t=patch_size_t,
+                        device=device,
+                        steps=PREVIEW_STEPS,
+                        cfg=eff_cfg,
+                        rescale=PREVIEW_CFG_RESCALE,
+                        cfg_audio=eff_audio_cfg,
+                        shift=shift,
+                        seed=preview_seed,
+                    )
+
+            finally:
+                if applied_local:
+                    restore_preview_lora_scale(model)
+
+        vae = LTXVaeHolder.get().to("cuda")
+
+        if PREVIEW_COMPARE_BASE:
+            print("  -> Generating BASE preview (LoRA scale 0.0)")
+            latents_base = _run_mode(0.0)
+
+            print("  -> Generating LoRA preview (LoRA scale {:.2f})".format(PREVIEW_LORA_SCALE))
+            latents_lora = _run_mode(PREVIEW_LORA_SCALE)
+
+            if latents_base is None or latents_lora is None:
+                return
+
+            with torch.no_grad():
+                img_base = decode_preview_latent(
+                    vae,
+                    latents_base,
+                    frame_index=PREVIEW_FRAME_INDEX,
                 )
 
-                prev_tokens = step_result[0].detach().to(torch.bfloat16)
-
-                latents = unpack_video_latent(
-                    prev_tokens,
-                    latent_shape,
-                    patch_size,
-                    patch_size_t,
+                img_lora = decode_preview_latent(
+                    vae,
+                    latents_lora,
+                    frame_index=PREVIEW_FRAME_INDEX,
                 )
 
-                latents = latents.detach()
+            img = np.concatenate([img_base, img_lora], axis=1)
 
-        latents = latents.detach()
+            vae.to("cpu")
 
-        vae = LTXVaeHolder.get().to(device)
+            out_name = preview_filename(step).replace(".png", "_compare_BASE_LoRA.png")
+            out_path = os.path.join(OUTPUT_DIR, out_name)
 
-        with torch.inference_mode():
-            img = decode_preview_latent(vae, latents)
+            Image.fromarray(img).save(out_path)
 
-        vae.to("cpu")
+            print("  -> Compare preview saved: {}".format(out_path))
 
-        out_path = os.path.join(OUTPUT_DIR, f"preview_step_{step}.png")
-        Image.fromarray(img).save(out_path)
+            free_vram(latents_base, latents_lora, img_base, img_lora, img)
 
-        print(f"  ↳ Preview saved to / Preview guardada: {out_path}")
+        else:
+            latents = _run_mode(PREVIEW_LORA_SCALE)
+
+            if latents is None:
+                return
+
+            with torch.no_grad():
+                img = decode_preview_latent(
+                    vae,
+                    latents,
+                    frame_index=PREVIEW_FRAME_INDEX,
+                )
+
+            vae.to("cpu")
+
+            out_path = os.path.join(OUTPUT_DIR, preview_filename(step))
+            Image.fromarray(img).save(out_path)
+
+            print("  -> Preview saved: {}".format(out_path))
+
+            free_vram(latents, img)
 
     except Exception as e:
-        print(f"  [!] Preview failed / Preview falló: {e}")
+        print("  [!] Preview diagnostic failed: {}".format(e))
+        traceback.print_exc()
 
     finally:
         if vae is not None:
@@ -1678,26 +2292,47 @@ def run_preview_ltx(
         free_vram()
 
 
-# ============================================================================
+# ===========================================================================
 # GLOBAL CONFIG REFERENCE
-# ============================================================================
-
+# ===========================================================================
 CURRENT_CONFIG = None
 CURRENT_TRANSFORMER = None
 CURRENT_AUDIO_CHANNELS = None
 
 
-# ============================================================================
+# ===========================================================================
 # TRAIN
-# ============================================================================
-
+# ===========================================================================
 def train_ltx23():
     global CURRENT_CONFIG
     global CURRENT_TRANSFORMER
     global CURRENT_AUDIO_CHANNELS
+    global ACTIVATION_OFFLOAD_ACTIVE
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
+
+    if LOW_VRAM_12GB:
+        try:
+            torch.cuda.memory._set_allocator_settings("garbage_collection_threshold:0.6")
+        except Exception:
+            pass
+
+        try:
+            if platform.system() != "Windows":
+                torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        except Exception:
+            pass
+
+    if ACTIVATION_OFFLOAD and not _SAVE_ON_CPU_AVAILABLE:
+        ACTIVATION_OFFLOAD_ACTIVE = False
+        print("[VRAM] activation_offload=True pero torch.autograd.graph.save_on_cpu")
+        print("       no está disponible (requiere PyTorch >= 2.1). Se desactiva.")
+    else:
+        ACTIVATION_OFFLOAD_ACTIVE = bool(ACTIVATION_OFFLOAD and _SAVE_ON_CPU_AVAILABLE)
+
+    if ACTIVATION_OFFLOAD_ACTIVE:
+        print("[VRAM] activation_offload ACTIVO: saved tensors -> CPU pinned.")
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA no está disponible.")
@@ -1705,7 +2340,7 @@ def train_ltx23():
     ensure_ltx23_model_downloaded(MODEL_ID)
 
     if not os.path.exists(CACHE_DIR):
-        raise RuntimeError(f"No existe caché: {CACHE_DIR}.")
+        raise RuntimeError("No existe cache: {}.".format(CACHE_DIR))
 
     print()
     print("Loading LTX-2.3 Transformer... / Cargando Transformer de LTX-2.3...")
@@ -1749,19 +2384,17 @@ def train_ltx23():
 
     del connectors
     del pipe
-
     free_vram()
 
     nf4_index = os.path.join(MODEL_ID, "index.json")
 
     if os.path.exists(nf4_index):
         print()
-        print("NF4 CACHE DETECTED! / ¡CACHÉ NF4 DETECTADA!")
+        print("NF4 CACHE DETECTED! / CACHE NF4 DETECTADA!")
 
         t0 = time.time()
 
         transformer = load_nf4_cache_(transformer, MODEL_ID)
-
         CURRENT_TRANSFORMER = transformer
 
         transformer.requires_grad_(False)
@@ -1770,12 +2403,10 @@ def train_ltx23():
             cast_frozen_to_bf16(transformer)
 
         transformer.to("cuda")
-
         free_vram()
 
-        print(f"[NF4] Cache loaded in / Caché cargada en {time.time() - t0:.1f}s")
-        print(f"Transformer pinned in VRAM. Usage / Uso: {torch.cuda.memory_allocated()/1e9:.1f} GB")
-
+        print("[NF4] Cache loaded in / Cache cargada en {:.1f}s".format(time.time() - t0))
+        print("Transformer pinned in VRAM. Usage / Uso: {:.1f} GB".format(torch.cuda.memory_allocated() / 1e9))
     else:
         raise RuntimeError("No existe caché NF4 en MODEL_ID.")
 
@@ -1789,8 +2420,7 @@ def train_ltx23():
             pass
 
     target_modules = discover_lora_targets(transformer)
-
-    print(f"Target LoRA Layers / Capas LoRA objetivo: {len(target_modules)}")
+    print("Target LoRA Layers / Capas LoRA objetivo: {}".format(len(target_modules)))
 
     lora_config = LoraConfig(
         r=LORA_RANK,
@@ -1823,6 +2453,9 @@ def train_ltx23():
     model.print_trainable_parameters()
 
     def make_inputs_require_grad(module, inputs, output):
+        if not torch.is_grad_enabled():
+            return
+
         if torch.is_tensor(output):
             output.requires_grad_(True)
 
@@ -1851,41 +2484,39 @@ def train_ltx23():
     # ------------------------------------------------------------
     # Resume checkpoint
     # ------------------------------------------------------------
-
-    # ------------------------------------------------------------
-    # Resume checkpoint (con detección de cambio de rank/targets)
-    # ------------------------------------------------------------
     start_step = 0
 
     adapter_path = os.path.join(RESUME_DIR, "adapter_model.safetensors")
     adapter_cfg_path = os.path.join(RESUME_DIR, "adapter_config.json")
 
-    # Si el checkpoint es de OTRA configuración de LoRA (rank distinto),
-    # el resume es imposible (shapes distintas) y solo genera warnings de
-    # "size mismatch". Lo detectamos ANTES de cargar y lo saltamos limpio.
     resume_compatible = True
+
     if os.path.exists(adapter_cfg_path):
         try:
             with open(adapter_cfg_path, "r", encoding="utf-8") as f:
                 acfg = json.load(f)
+
             saved_r = int(acfg.get("r", -1))
             saved_alpha = int(acfg.get("lora_alpha", -1))
+
             if saved_r != LORA_RANK:
                 resume_compatible = False
+
                 print("=" * 65)
-                print(f"[!] Checkpoint INCOMPATIBLE: rank guardado={saved_r}, "
-                      f"rank actual={LORA_RANK}.")
+                print("[!] Checkpoint INCOMPATIBLE: rank guardado={}, rank actual={}.".format(
+                    saved_r, LORA_RANK
+                ))
                 print("    Al cambiar rank hay que entrenar desde 0.")
                 print("    Se IGNORA el checkpoint y se arranca limpio.")
-                print("    (Borra resume_checkpoint/ y current_step.txt para")
-                print("     limpiarlo del disco.)")
+                print("    Borra resume_checkpoint/ y current_step.txt para limpiarlo.")
                 print("=" * 65)
         except Exception:
             pass
 
     if resume_compatible and os.path.exists(adapter_path) and os.path.exists(STEP_FILE):
         print("=" * 65)
-        print("Checkpoint detected! Restoring state... / ¡Checkpoint detectado! Restaurando estado...")
+        print("Checkpoint detected! Restoring state... / Checkpoint detectado! Restaurando estado...")
+
         try:
             with open(STEP_FILE, "r", encoding="utf-8") as f:
                 start_step = int(f.read().strip())
@@ -1900,10 +2531,10 @@ def train_ltx23():
                 except Exception:
                     print("[!] No se pudo restaurar optimizer. Se continúa con optimizer nuevo.")
 
-            print(f"Resuming training from step / Reanudando entrenamiento desde el paso {start_step}...")
+            print("Resuming training from step / Reanudando entrenamiento desde el paso {}...".format(start_step))
 
         except Exception as e:
-            print(f"[!] Warning reading checkpoint / Advertencia al leer checkpoint: {e}")
+            print("[!] Warning reading checkpoint / Advertencia al leer checkpoint: {}".format(e))
             start_step = 0
 
         print("=" * 65)
@@ -1913,13 +2544,12 @@ def train_ltx23():
     # ------------------------------------------------------------
     # Checkpoint saver
     # ------------------------------------------------------------
-
     def save_checkpoint_now(current_s):
         if current_s <= 0:
             return
 
         print()
-        print(f"Saving checkpoint state at step / Guardando estado en paso {current_s}...")
+        print("Saving checkpoint state at step / Guardando estado en paso {}...".format(current_s))
 
         os.makedirs(RESUME_DIR, exist_ok=True)
 
@@ -1940,21 +2570,20 @@ def train_ltx23():
             pass
 
         try:
-            ckpt = os.path.join(OUTPUT_DIR, f"LTX23_LoRA_step_{current_s}.safetensors")
+            ckpt = os.path.join(OUTPUT_DIR, "LTX23_LoRA_step_{}.safetensors".format(current_s))
             save_lora(model, ckpt)
-            print(f"Checkpoint saved successfully at step / Checkpoint guardado en paso {current_s}: {ckpt}")
+            print("Checkpoint saved successfully at step / Checkpoint guardado en paso {}: {}".format(current_s, ckpt))
         except Exception:
             pass
 
     # ------------------------------------------------------------
     # Signal handlers
     # ------------------------------------------------------------
-
     def handle_signal(sig, frame):
         nonlocal last_step_executed
 
         print()
-        print(f"Signal received / Señal de detención recibida ({sig}).")
+        print("Signal received / Señal de detención recibida ({}).".format(sig))
 
         save_checkpoint_now(last_step_executed)
         sys.exit(0)
@@ -1965,14 +2594,12 @@ def train_ltx23():
 
         if hasattr(signal, "SIGBREAK"):
             signal.signal(signal.SIGBREAK, handle_signal)
-
     except Exception:
         pass
 
     # ------------------------------------------------------------
     # LR
     # ------------------------------------------------------------
-
     def lr_at(step):
         if step < WARMUP_STEPS:
             return LR * step / max(1, WARMUP_STEPS)
@@ -1989,7 +2616,6 @@ def train_ltx23():
     # ------------------------------------------------------------
     # Seed
     # ------------------------------------------------------------
-
     if SEED > 0:
         torch.manual_seed(SEED)
         random.seed(SEED)
@@ -1998,7 +2624,6 @@ def train_ltx23():
     # ------------------------------------------------------------
     # TRAIN
     # ------------------------------------------------------------
-
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
@@ -2006,8 +2631,8 @@ def train_ltx23():
     avg_time = 0.0
 
     print()
-    print(f"STARTING TRAINING / ¡ARRANCANDO ENTRENAMIENTO! {len(entries)} images cached / imágenes cacheadas.")
-    print(f"LoRA export prefix / Prefijo de exportación: '{LORA_KEY_PREFIX}' (scaling alpha/rank horneado en lora_B).")
+    print("STARTING TRAINING / ARRANCANDO ENTRENAMIENTO! {} entradas cacheadas.".format(len(entries)))
+    print("LoRA export prefix / Prefijo de exportación: '{}'".format(LORA_KEY_PREFIX))
 
     try:
         for step in range(start_step + 1, TOTAL_STEPS + 1):
@@ -2023,6 +2648,12 @@ def train_ltx23():
             video_clean = entry["video"].to("cuda", dtype=torch.bfloat16, non_blocking=True)
             audio_clean = entry["audio"].to("cuda", dtype=torch.bfloat16, non_blocking=True)
 
+            if video_clean.ndim == 4:
+                video_clean = video_clean.unsqueeze(0)
+
+            if audio_clean.ndim == 2:
+                audio_clean = audio_clean.unsqueeze(0)
+
             video_text = entry["video_text"].to("cuda", dtype=torch.bfloat16, non_blocking=True)
             audio_text = entry["audio_text"].to("cuda", dtype=torch.bfloat16, non_blocking=True)
 
@@ -2035,10 +2666,19 @@ def train_ltx23():
             patch_size = int(getattr(CURRENT_CONFIG, "patch_size", 1))
             patch_size_t = int(getattr(CURRENT_CONFIG, "patch_size_t", 1))
 
+            video_clean = align_video_latent_to_patch(video_clean, patch_size, patch_size_t)
+
             video_tokens = patch_video_latent(video_clean, patch_size, patch_size_t)
             audio_tokens = patch_audio_latent(audio_clean)
 
             B = video_tokens.shape[0]
+            video_seq_len = video_tokens.shape[1]
+
+            num_frames = video_clean.shape[2]
+            height = video_clean.shape[3]
+            width = video_clean.shape[4]
+
+            audio_num_frames = audio_clean.shape[-1]
 
             sigma = torch.rand(B, device="cuda", dtype=torch.float32).clamp(1e-4, 1.0 - 1e-4)
 
@@ -2060,7 +2700,7 @@ def train_ltx23():
 
             timestep = make_video_timestep(
                 sigma,
-                video_tokens.shape[1],
+                video_seq_len,
                 "cuda",
                 torch.bfloat16,
             )
@@ -2069,7 +2709,15 @@ def train_ltx23():
                 sigma * float(getattr(CURRENT_CONFIG, "timestep_scale_multiplier", 1000))
             ).to(torch.bfloat16)
 
-            _, _, num_frames, height, width = video_clean.shape
+            del video_clean, audio_clean, video_tokens, audio_tokens
+            del noise_video, noise_audio, t_video, t_audio
+
+            video_clean = None
+            audio_clean = None
+            video_tokens = None
+            audio_tokens = None
+            noise_video = None
+            noise_audio = None
 
             forward_kwargs = {
                 "hidden_states": noisy_video,
@@ -2084,38 +2732,42 @@ def train_ltx23():
                 "height": height,
                 "width": width,
                 "fps": FRAME_RATE,
-                "audio_num_frames": audio_clean.shape[-1],
+                "audio_num_frames": audio_num_frames,
                 "return_dict": False,
             }
 
-            signature = inspect.signature(transformer.forward)
+            forward_kwargs = filter_forward_kwargs(forward_kwargs, transformer.forward)
 
-            forward_kwargs = {
-                k: v
-                for k, v in forward_kwargs.items()
-                if k in signature.parameters
-            }
+            if ACTIVATION_OFFLOAD_ACTIVE:
+                try:
+                    with _save_on_cpu_ctx(pin_memory=True):
+                        output = model(**forward_kwargs)
+                except Exception as e_offload:
+                    print()
+                    print("[VRAM] save_on_cpu falló en runtime ({}).".format(e_offload))
+                    print("       Se desactiva activation_offload y se reintenta el step sin offload.")
 
-            output = model(**forward_kwargs)
+                    ACTIVATION_OFFLOAD_ACTIVE = False
+                    output = model(**forward_kwargs)
+            else:
+                output = model(**forward_kwargs)
+
+            pred_video = None
+            pred_audio = None
 
             if isinstance(output, tuple):
                 if len(output) == 0:
-                    raise RuntimeError("LTX-2.3 forward devolvió tuple vacía.")
+                    raise RuntimeError("LTX-2.3 forward devolvió tupla vacía.")
 
                 pred_video = output[0]
 
                 if len(output) > 1 and USE_AUDIO_LOSS:
                     pred_audio = output[1]
-                else:
-                    pred_audio = None
-
             else:
                 pred_video = getattr(output, "video", None)
 
                 if pred_video is None:
                     pred_video = getattr(output, "sample", None)
-
-                pred_audio = None
 
                 if USE_AUDIO_LOSS:
                     pred_audio = getattr(output, "audio", None)
@@ -2124,17 +2776,14 @@ def train_ltx23():
                         pred_audio = getattr(output, "audio_sample", None)
 
             if pred_video is None:
-                raise RuntimeError("No se pudo obtener predicción de vídeo.")
+                raise RuntimeError("No se pudo obtener predicción de video.")
 
             output = None
 
             if not USE_AUDIO_LOSS:
                 pred_audio = None
 
-            if USE_AUDIO_LOSS and pred_audio is not None:
-                if target_audio is None:
-                    target_audio = noise_audio - audio_tokens
-
+            if USE_AUDIO_LOSS and pred_audio is not None and target_audio is not None:
                 if pred_audio.shape != target_audio.shape:
                     raise RuntimeError("La forma de salida de audio no coincide con el target.")
 
@@ -2142,7 +2791,6 @@ def train_ltx23():
                 loss_audio = mse_loss_chunked(pred_audio, target_audio)
 
                 loss = (loss_video + loss_audio) * 0.5
-
             else:
                 loss = mse_loss_chunked(pred_video, target_video)
 
@@ -2155,7 +2803,6 @@ def train_ltx23():
 
             if step % GRAD_ACCUM_STEPS == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable, MAX_GRAD_NORM).item()
-
                 current_lr = lr_at(step)
 
                 for group in optimizer.param_groups:
@@ -2163,17 +2810,19 @@ def train_ltx23():
 
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-
             else:
                 grad_norm = 0.0
                 current_lr = lr_at(step)
 
             elapsed = time.time() - t0
-
             avg_time = elapsed if avg_time == 0 else (0.1 * elapsed + 0.9 * avg_time)
 
             eta_s = (TOTAL_STEPS - step) * avg_time
-            eta = f"{int(eta_s // 3600):02d}:{int((eta_s % 3600) // 60):02d}:{int(eta_s % 60):02d}"
+            eta = "{:02d}:{:02d}:{:02d}".format(
+                int(eta_s // 3600),
+                int((eta_s % 3600) // 60),
+                int(eta_s % 60),
+            )
 
             pct = step / TOTAL_STEPS
             barra = "█" * int(pct * 20) + "░" * (20 - int(pct * 20))
@@ -2181,25 +2830,25 @@ def train_ltx23():
             avg_loss = running_loss / max(1, step - start_step)
 
             progress_line = (
-                f"Step/Paso {step:4d}/{TOTAL_STEPS} [{barra}] {pct * 100:5.1f}% | "
-                f"Loss {avg_loss:.4f} | gnorm {grad_norm:.3f} | "
-                f"lr {current_lr:.2e} | {avg_time:.2f}s/it | ETA {eta}"
+                "Step/Paso {:4d}/{} [{}] {:5.1f}% | "
+                "Loss {:.4f} | gnorm {:.3f} | "
+                "lr {:.2e} | {:.2f}s/it | ETA {}".format(
+                    step,
+                    TOTAL_STEPS,
+                    barra,
+                    pct * 100,
+                    avg_loss,
+                    grad_norm,
+                    current_lr,
+                    avg_time,
+                    eta,
+                )
             )
 
-            print(f"\r{progress_line}", end="", flush=True)
+            print("\r{}".format(progress_line), end="", flush=True)
 
             if SAVE_EVERY > 0 and step % SAVE_EVERY == 0:
                 save_checkpoint_now(step)
-
-            if PREVIEW_EVERY > 0 and step % PREVIEW_EVERY == 0:
-                run_preview_ltx(
-                    model,
-                    scheduler,
-                    entries,
-                    special_texts,
-                    step,
-                    AUDIO_CHANNELS,
-                )
 
             free_vram(
                 video_clean,
@@ -2225,6 +2874,16 @@ def train_ltx23():
                 loss,
             )
 
+            if PREVIEW_EVERY > 0 and step % PREVIEW_EVERY == 0:
+                run_preview_diagnostic(
+                    model,
+                    scheduler,
+                    entries,
+                    special_texts,
+                    step,
+                    AUDIO_CHANNELS,
+                )
+
     except KeyboardInterrupt:
         save_checkpoint_now(last_step_executed)
         return
@@ -2234,15 +2893,15 @@ def train_ltx23():
 
     print()
     print()
-    print("Training completed! / ¡Entrenamiento finalizado!")
+    print("Training completed! / Entrenamiento finalizado!")
 
     save_checkpoint_now(TOTAL_STEPS)
 
     final_path = os.path.join(OUTPUT_DIR, "LTX23_FINAL_LoRA.safetensors")
     save_lora(model, final_path)
 
-    print(f"Final LoRA saved to / Tu LoRA definitivo está en: {final_path}")
-    print(f"Formato exportado: prefijo='{LORA_KEY_PREFIX}', sin '.default', scaling horneado -> usa strength=1.0 en ComfyUI.")
+    print("Final LoRA saved to / Tu LoRA definitivo está en: {}".format(final_path))
+    print("Formato exportado: prefijo='{}', scaling horneado -> usa strength=1.0 en ComfyUI.".format(LORA_KEY_PREFIX))
 
     for hook in hooks:
         try:
