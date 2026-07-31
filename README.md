@@ -4,7 +4,5 @@
 
 ![Interface](assets/interface.jpg)
 
-TO DO
-BAJAR PICOS DE CONSUMO DE RAM EN LA PRE-CACHE
-y MEJORAR LA PREVIEW
+
 
