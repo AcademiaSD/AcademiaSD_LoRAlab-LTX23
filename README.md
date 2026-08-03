@@ -15,7 +15,7 @@
 
 ---
 ## YouTube video instructions.
-
+https://www.youtube.com/watch?v=52Kyr7GZ6Y0
 ---
 
 ## 🔬 Technical Deep-Dive: Why is it so fast, light, & high quality?
