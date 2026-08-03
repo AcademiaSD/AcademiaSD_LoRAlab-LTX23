@@ -111,6 +111,11 @@ Run_LoRAlab-Krea2.bat
 ```
 The server will start, and your web browser will automatically open `http://127.0.0.1:5000`.
 
+Unpate LoRAlab-LTX2.3.
+```cmd
+Update_LoRAlab-LTX23.bat
+```
+
 ### 2. Pre-Cache Dataset
 1. Enter a **Project Name** (e.g., `cherry2`).
 2. Select your image folder using the native Windows file requester (**Browse / Explorar**).
