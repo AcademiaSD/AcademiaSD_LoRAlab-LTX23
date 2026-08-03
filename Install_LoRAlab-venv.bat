@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-title Instalador Venv Krea-2 Trainer - NVIDIA
+title Instalador Venv LTX 2.3 LoRAlab Trainer - NVIDIA
 
 :: ========================================================
 :: CONFIGURACION
@@ -12,7 +12,7 @@ set "PYTHON_INSTALLER=%BASE_DIR%python-3.13.1-amd64.exe"
 set "PYTHON_EXE="
 
 echo ========================================================
-echo   INSTALADOR KREA-2 LORA TRAINER
+echo   INSTALADOR LTX-2.3 LORA TRAINER
 echo   Entorno Python 3.13.1 + PyTorch CUDA
 echo   Compatible con GPUs NVIDIA modernas
 echo ========================================================
@@ -586,7 +586,8 @@ echo Version Hugging Face Hub:
 echo.
 echo ========================================================
 echo.
-echo El entorno esta listo para ejecutar el Krea-2 Trainer.
+echo El entorno esta listo para ejecutar el LoRAlab Trainer.
+echo The environment is ready to run the LoRAlab Trainer.
 echo.
 pause
 
