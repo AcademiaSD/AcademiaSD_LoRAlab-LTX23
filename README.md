@@ -141,8 +141,8 @@ AcademiaSD_LoRAlab-LTX23/
 ├── assets/
 │   ├── banner.png             # Web GUI top header banner
 │   └── logo.png               # Logo & browser favicon
-├── 1_pre_cache_krea2.py        # Latent VAE & Text Embedding pre-caching script
-├── 2_train_lora_krea2.py       # DiT 12B NF4 LoRA training script
+├── 1_pre_cache_LTX23.py        # Latent VAE & Text Embedding pre-caching script
+├── 2_train_lora_LTX232.py       # DiT 12B NF4 LoRA training script
 ├── server.py                   # Flask backend web server
 ├── trainer_ui.html             # HTML5 / CSS3 / JS Web GUI
 ├── Run_LoRAlab-LTX23.bat       # Windows 1-click launcher
