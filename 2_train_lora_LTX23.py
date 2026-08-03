@@ -92,7 +92,7 @@ DEFAULTS = {
     "weight_decay": 0.0,
     "max_grad_norm": 1.0,
 
-    "save_every": 20,
+    "save_every": 100,
     "seed": 314159,
     "frame_rate": 24.0,
 

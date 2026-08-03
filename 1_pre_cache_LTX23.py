@@ -5,16 +5,19 @@
 Pre-cache de LTX-2.3 para entrenamiento LoRA (dataset de imágenes).
 
 OPTIMIZACIÓN DE VRAM:
-  El text encoder de LTX-2.3 es enorme y NO cabe en GPUs de 16 GB.
-  Antes se hacía pipe.to("cuda") y se saturaba la VRAM (swap -> lentísimo).
-  Ahora el pipeline se carga en CPU y se aplica offload según
-  `precache_offload`:
-    - "none"      : todo en VRAM (solo si tienes VRAM de sobra).
-    - "model"     : 1 componente en VRAM cada vez (solo si cada uno cabe).
-    - "sequential": capa por capa en VRAM (RECOMENDADO en 16 GB).
-    - "cpu"       : text encoder en CPU, VAE en VRAM (lento pero 0 VRAM texto).
-  Y con `text_encoder_4bit: true` se intenta cuantizar el text encoder a
-  4-bit para que quepa entero en VRAM (experimental, con fallback).
+El text encoder de LTX-2.3 es enorme y NO cabe en GPUs de 16 GB.
+Antes se hacía pipe.to("cuda") y se saturaba la VRAM (swap -> lentísimo).
+
+Ahora el pipeline se carga en CPU y se aplica offload según
+`precache_offload`:
+
+- "none"      : todo en VRAM (solo si tienes VRAM de sobra).
+- "model"     : 1 componente en VRAM cada vez (solo si cada uno cabe).
+- "sequential": capa por capa en VRAM (RECOMENDADO en 16 GB).
+- "cpu"       : text encoder en CPU, VAE en VRAM (lento pero 0 VRAM texto).
+
+Y con `text_encoder_4bit: true` se intenta cuantizar el text encoder a
+4-bit para que quepa entero en VRAM (experimental, con fallback).
 """
 
 import os
@@ -28,7 +31,6 @@ import shutil
 
 import torch
 import torchvision.transforms.functional as F_vision
-
 from PIL import Image
 from diffusers import DiffusionPipeline
 
@@ -53,11 +55,16 @@ DEFAULTS = {
 
     # --- NUEVAS: gestión de VRAM del pre-cache ---
     "precache_offload": "sequential",   # none | model | sequential | cpu
-    "text_encoder_4bit": True,         # experimental: cuantiza text encoder a 4-bit
+    "text_encoder_4bit": True,          # experimental: cuantiza text encoder a 4-bit
 }
 
 CONFIG_PATH = "pre_cache_settings.json"
 
+HF_BASE_REPO_ID = "diffusers/LTX-2.3-Diffusers"
+HF_NF4_REPO_ID = "AcademiaSD/LTX23_NF4"
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "0")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -76,11 +83,36 @@ else:
 
 
 def cfg_get(key, default):
-    if key in cfg:
-        return cfg[key]
-    if (key + " ") in cfg:
-        return cfg[key + " "]
+    if not isinstance(cfg, dict):
+        return default
+
+    candidates = [
+        key,
+        key + " ",
+        " " + key,
+        " " + key + " ",
+    ]
+
+    for candidate in candidates:
+        if candidate in cfg:
+            return cfg[candidate]
+
     return default
+
+
+def _cfg_bool(key, default):
+    value = cfg_get(key, default)
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+    return bool(value)
 
 
 MODEL_ID = str(cfg_get("model_id", DEFAULTS["model_id"])).strip()
@@ -95,8 +127,14 @@ TRIGGER_WORD = str(cfg_get("trigger_word", DEFAULTS["trigger_word"])).strip()
 PROJECT_NAME = str(cfg_get("project_name", DEFAULTS["project_name"])).strip()
 PREVIEW_CUSTOM_PROMPT = str(cfg_get("preview_custom_prompt", DEFAULTS["preview_custom_prompt"])).strip()
 
-PRECACHE_OFFLOAD = str(cfg_get("precache_offload", DEFAULTS["precache_offload"])).strip().lower()
-TEXT_ENCODER_4BIT = bool(cfg_get("text_encoder_4bit", DEFAULTS["text_encoder_4bit"]))
+PRECACHE_OFFLOAD = str(
+    cfg_get("precache_offload", DEFAULTS["precache_offload"])
+).strip().lower()
+
+TEXT_ENCODER_4BIT = _cfg_bool(
+    "text_encoder_4bit",
+    DEFAULTS["text_encoder_4bit"]
+)
 
 if PROJECT_NAME:
     CACHE_DIR = f"./cached_data_ltx23_{PROJECT_NAME}"
@@ -105,6 +143,108 @@ else:
 
 # LTX-2.3 exige dimensiones divisibles por 32.
 MULTIPLE = max(32, MULTIPLE)
+
+
+# ============================================================================
+# DESCARGA DESDE HUGGING FACE
+# ============================================================================
+
+def get_hf_token():
+    if os.path.exists("HF_token.json"):
+        try:
+            with open("HF_token.json", "r", encoding="utf-8") as f:
+                token_data = json.load(f)
+
+            token = token_data.get("token", "").strip()
+            if token:
+                return token
+        except Exception:
+            pass
+
+    token = os.environ.get("HF_TOKEN", "").strip()
+    if token:
+        return token
+
+    return None
+
+
+def ensure_ltx23_model_downloaded(local_path):
+    local_path = str(local_path or "./LTX23-NF4").strip()
+
+    if not local_path:
+        local_path = "./LTX23-NF4"
+
+    has_base = os.path.exists(os.path.join(local_path, "model_index.json"))
+    has_nf4 = os.path.exists(os.path.join(local_path, "index.json"))
+
+    if has_base and has_nf4:
+        print(f"[OK] Modelo local encontrado en / Local model found at: {local_path}")
+        return local_path
+
+    print()
+    print("=" * 80)
+    print("WARNING / ATENCIÓN")
+    print("=" * 80)
+    print("This will download more than 100 GB. This may take several minutes.")
+    print("Esto descargará más de 100 GB. Esto puede tardar varios minutos.")
+    print("=" * 80)
+
+    auto = os.environ.get("LTX_AUTO_CONFIRM_DOWNLOAD", "0").strip().lower()
+
+    if auto not in ("1", "true", "yes", "y", "on"):
+        try:
+            input("Press Enter to continue / Pulsa Enter para continuar...")
+        except Exception:
+            pass
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        raise ImportError(
+            "huggingface_hub is required. Install with: pip install huggingface_hub"
+        )
+
+    token = get_hf_token()
+
+    if token:
+        print("✓ Using HF Token / Usando token de HF")
+
+    os.makedirs(local_path, exist_ok=True)
+
+    print()
+    print("Downloading / Descargando:", HF_BASE_REPO_ID)
+
+    snapshot_download(
+        repo_id=HF_BASE_REPO_ID,
+        local_dir=local_path,
+        token=token,
+        max_workers=4,
+    )
+
+    print()
+    print("Downloading / Descargando:", HF_NF4_REPO_ID)
+
+    snapshot_download(
+        repo_id=HF_NF4_REPO_ID,
+        local_dir=local_path,
+        token=token,
+        max_workers=4,
+    )
+
+    if not os.path.exists(os.path.join(local_path, "model_index.json")):
+        raise RuntimeError(
+            f"Descarga incompleta: falta model_index.json en {local_path}"
+        )
+
+    if not os.path.exists(os.path.join(local_path, "index.json")):
+        raise RuntimeError(
+            f"Descarga incompleta: falta index.json en {local_path}"
+        )
+
+    print()
+    print(f"[OK] Modelo descargado en / Model downloaded to: {local_path}")
+
+    return local_path
 
 
 # ============================================================================
@@ -141,16 +281,19 @@ def vram_peak_gb():
 
 
 def read_audio_channels(model_id, default=128):
-    """Lee audio_in_channels del config.json del transformer en disco (0 VRAM)."""
+    """
+    Lee audio_in_channels del config.json del transformer en disco (0 VRAM).
+    """
     for rel in ("transformer/config.json", os.path.join("transformer", "config.json")):
         p = os.path.join(model_id, rel)
         if os.path.exists(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     c = json.load(f)
-                return int(c.get("audio_in_channels", default))
+                    return int(c.get("audio_in_channels", default))
             except Exception:
                 pass
+
     return default
 
 
@@ -159,19 +302,26 @@ def read_model_index_components(model_id):
     Lee model_index.json y devuelve los componentes del pipeline.
     """
     path = os.path.join(model_id, "model_index.json")
+
     if not os.path.exists(path):
         return {}
+
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+
         out = {}
+
         if isinstance(data, dict):
             for key, value in data.items():
                 if key.startswith("_"):
                     continue
+
                 if isinstance(value, (list, tuple)) and len(value) == 2:
                     out[key] = value
+
         return out
+
     except Exception as exc:
         print("[LIGHT] No se pudo leer model_index.json: {}".format(exc))
         return {}
@@ -182,15 +332,25 @@ def resolve_component_class(model_id, component_name, current_object=None):
     Resuelve la clase de un componente del pipeline a partir de model_index.json.
     """
     info = read_model_index_components(model_id).get(component_name)
+
     if info is not None:
         module_name, class_name = info
+
         try:
             module = importlib.import_module(module_name)
             return getattr(module, class_name)
         except Exception as exc:
-            print("[LIGHT] No se pudo importar {}.{}: {}".format(module_name, class_name, exc))
+            print(
+                "[LIGHT] No se pudo importar {}.{}: {}".format(
+                    module_name,
+                    class_name,
+                    exc
+                )
+            )
+
     if current_object is not None:
         return type(current_object)
+
     return None
 
 
@@ -218,17 +378,20 @@ def unload_pipeline_component(pipe, name):
     Libera de RAM un componente del pipeline antes de recargarlo.
     """
     obj = getattr(pipe, name, None)
+
     if obj is not None:
         try:
             setattr(pipe, name, None)
         except Exception:
             pass
+
         try:
             del obj
         except Exception:
             pass
 
     gc.collect()
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -241,6 +404,7 @@ def auto_max_memory_for_cuda():
         free, total = torch.cuda.mem_get_info()
         free_gb = free / 1e9
         limit_gb = max(2.0, free_gb - 1.0)
+
         return {
             0: "{:.0f}GiB".format(limit_gb),
             "cpu": "10GiB",
@@ -277,9 +441,11 @@ def load_precache_pipeline_light(model_id, skip_text_encoders=True):
             **overrides
         )
         return pipe
+
     except TypeError as exc:
         print("[LIGHT] Overrides no aceptados por el pipeline ({}).".format(exc))
         print("[LIGHT] Fallback: cargando solo sin transformer.")
+
         return DiffusionPipeline.from_pretrained(
             model_id,
             transformer=None,
@@ -291,12 +457,18 @@ def load_precache_pipeline_light(model_id, skip_text_encoders=True):
 def quantize_one_text_encoder_4bit(pipe, component_name):
     """
     Cuantiza UN text encoder concreto:
+
     - libera antes el original de RAM
     - intenta cargarlo shard a shard directo a VRAM
     - si falla, intenta auto con offload
     """
     current_object = getattr(pipe, component_name, None)
-    component_class = resolve_component_class(MODEL_ID, component_name, current_object)
+
+    component_class = resolve_component_class(
+        MODEL_ID,
+        component_name,
+        current_object
+    )
 
     if component_class is None:
         print("[4bit] No se pudo resolver la clase de {}.".format(component_name))
@@ -345,11 +517,17 @@ def quantize_one_text_encoder_4bit(pipe, component_name):
             "low_cpu_mem_usage": True,
             "subfolder": component_name,
         }
+
         kwargs.update(extra_kwargs)
 
         try:
             print("[4bit] {} -> intentando {}...".format(component_name, label))
-            new_object = component_class.from_pretrained(MODEL_ID, **kwargs)
+
+            new_object = component_class.from_pretrained(
+                MODEL_ID,
+                **kwargs
+            )
+
             setattr(pipe, component_name, new_object)
 
             print("[4bit] {} cuantizado OK con {}.".format(component_name, label))
@@ -365,22 +543,36 @@ def quantize_one_text_encoder_4bit(pipe, component_name):
 
         except Exception as exc:
             print("[4bit] {} fallo con {}: {}".format(component_name, label, exc))
+
             gc.collect()
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
     # Fallback: cargar original en CPU para no romper el pipeline
     try:
-        print("[4bit] {} -> recargando original bf16 en CPU como fallback...".format(component_name))
+        print(
+            "[4bit] {} -> recargando original bf16 en CPU como fallback...".format(
+                component_name
+            )
+        )
+
         fallback_object = component_class.from_pretrained(
             MODEL_ID,
             subfolder=component_name,
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
         )
+
         setattr(pipe, component_name, fallback_object)
+
     except Exception as exc:
-        print("[4bit] CRITICO: no se pudo restaurar {}: {}".format(component_name, exc))
+        print(
+            "[4bit] CRITICO: no se pudo restaurar {}: {}".format(
+                component_name,
+                exc
+            )
+        )
 
     return False, None
 
@@ -388,9 +580,10 @@ def quantize_one_text_encoder_4bit(pipe, component_name):
 def try_quantize_text_encoders_4bit(pipe):
     """
     Cuantiza TODOS los text encoders detectados, uno detrás de otro.
+
     Devuelve:
-      - True/False si todos se cuantizaron correctamente
-      - text_device recomendado
+    - True/False si todos se cuantizaron correctamente
+    - text_device recomendado
     """
     names = list_text_encoder_components(pipe)
 
@@ -404,10 +597,12 @@ def try_quantize_text_encoders_4bit(pipe):
 
     for name in names:
         ok, label = quantize_one_text_encoder_4bit(pipe, name)
+
         if not ok:
             all_ok = False
 
         gc.collect()
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -421,11 +616,13 @@ def try_quantize_text_encoders_4bit(pipe):
 def _patch_module_to_noop_device(module):
     """
     Neutraliza module.to(...) para cambios de DEVICE (no de dtype).
+
     Evita que encode_prompt haga text_encoder.to("cuda") y dispare OOM
     cuando usamos offload secuencial (cuyos hooks ya mueven las hojas).
     """
     if module is None:
         return
+
     if getattr(module, "_ltx_to_patched", False):
         return
 
@@ -433,6 +630,7 @@ def _patch_module_to_noop_device(module):
 
     def _to(*args, **kwargs):
         dtype = kwargs.get("dtype", None)
+
         for a in args:
             if isinstance(a, torch.dtype):
                 dtype = a
@@ -473,6 +671,7 @@ def setup_offload(pipe, mode):
         # Text encoder en CPU (0 VRAM de texto), VAE en VRAM (cabe).
         if vae is not None:
             vae.to("cuda")
+
         print("[OFFLOAD] cpu -> text encoder en CPU, VAE en VRAM.")
         print(f"[VRAM] tras mover VAE: {vram_gb():.2f} GB")
         return "cpu"
@@ -490,82 +689,133 @@ def setup_offload(pipe, mode):
     # mode == "sequential"
     try:
         pipe.enable_sequential_cpu_offload(device="cuda")
+
         # Blindar todos los text encoders y connectors contra .to("cuda") internos.
         for attr in ("text_encoder", "text_encoder_2", "text_encoder_3", "connectors"):
             _patch_module_to_noop_device(getattr(pipe, attr, None))
-        #print("[OFFLOAD] sequential -> text encoder capa por capa en VRAM.")
-        #print(f"[VRAM] pico tras setup: {vram_peak_gb():.2f} GB")
+
         return "cuda"
+
     except Exception as e:
         print("[OFFLOAD] sequential falló, fallback a cpu:", e)
+
         if vae is not None:
             vae.to("cuda")
+
         return "cpu"
 
 
 def json_safe(value):
     if isinstance(value, torch.dtype):
         return str(value)
+
     if isinstance(value, torch.Size):
         return list(value)
+
     if torch.is_tensor(value):
-        return {"tensor": True, "shape": list(value.shape), "dtype": str(value.dtype)}
+        return {
+            "tensor": True,
+            "shape": list(value.shape),
+            "dtype": str(value.dtype)
+        }
+
     if isinstance(value, dict):
         return {str(k): json_safe(v) for k, v in value.items()}
+
     if isinstance(value, (list, tuple)):
         return [json_safe(v) for v in value]
+
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
+
     return str(value)
 
 
 def atomic_json(data, path):
     tmp = path + ".tmp"
+
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(json_safe(data), f, indent=2, ensure_ascii=False)
         f.flush()
         os.fsync(f.fileno())
+
     os.replace(tmp, path)
 
 
 def bucket_size(width, height):
     ar = width / height
+
     bh = math.sqrt(TARGET_AREA / ar)
     bw = ar * bh
+
     bw = max(MULTIPLE, round(bw / MULTIPLE) * MULTIPLE)
     bh = max(MULTIPLE, round(bh / MULTIPLE) * MULTIPLE)
+
     if max(bw, bh) > MAX_SIDE:
         scale = MAX_SIDE / max(bw, bh)
+
         bw = max(MULTIPLE, int(bw * scale) // MULTIPLE * MULTIPLE)
         bh = max(MULTIPLE, int(bh * scale) // MULTIPLE * MULTIPLE)
+
     return int(bw), int(bh)
 
 
 def read_prompt(base_name):
     path = os.path.join(DATASET_PATH, base_name + ".txt")
+
     prompt = ""
+
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             prompt = f.read().strip()
+
     if TRIGGER_WORD and TRIGGER_WORD.lower() not in prompt.lower():
         prompt = f"{TRIGGER_WORD}, {prompt}".strip(", ")
+
     return prompt
 
 
 def save_prompt_result(result, prefix):
     def recurse(obj, path):
         if torch.is_tensor(obj):
-            filename = f"{prefix}_" + path.replace(".", "_") + ".pt"
+            safe_path = path.replace(".", "_").replace("/", "_").replace("\\", "_")
+            filename = f"{prefix}_{safe_path}.pt"
+
             torch.save(obj.detach().cpu(), os.path.join(CACHE_DIR, filename))
-            return {"type": "tensor", "file": filename, "shape": list(obj.shape), "dtype": str(obj.dtype)}
+
+            return {
+                "type": "tensor",
+                "file": filename,
+                "shape": list(obj.shape),
+                "dtype": str(obj.dtype)
+            }
+
         if isinstance(obj, dict):
-            return {"type": "dict", "items": {str(k): recurse(v, f"{path}_{k}") for k, v in obj.items()}}
+            return {
+                "type": "dict",
+                "items": {
+                    str(k): recurse(v, f"{path}_{k}")
+                    for k, v in obj.items()
+                }
+            }
+
         if isinstance(obj, (tuple, list)):
-            return {"type": "tuple" if isinstance(obj, tuple) else "list", "items": [recurse(v, f"{path}_{i}") for i, v in enumerate(obj)]}
-        return {"type": "value", "value": json_safe(obj)}
+            return {
+                "type": "tuple" if isinstance(obj, tuple) else "list",
+                "items": [
+                    recurse(v, f"{path}_{i}")
+                    for i, v in enumerate(obj)
+                ]
+            }
+
+        return {
+            "type": "value",
+            "value": json_safe(obj)
+        }
 
     structure = recurse(result, "root")
     atomic_json(structure, os.path.join(CACHE_DIR, f"{prefix}_structure.json"))
+
     return structure
 
 
@@ -576,15 +826,18 @@ def extract_prompt_tensors(result):
         if torch.is_tensor(obj):
             found.append((path, obj.detach().cpu()))
             return
+
         if isinstance(obj, dict):
             for k, v in obj.items():
                 recurse(v, f"{path}.{k}")
             return
+
         if isinstance(obj, (tuple, list)):
             for i, v in enumerate(obj):
                 recurse(v, f"{path}.{i}")
 
     recurse(result)
+
     return found
 
 
@@ -597,11 +850,13 @@ def encode_prompt(pipe, prompt, text_device):
         device=torch.device(text_device),
         dtype=torch.bfloat16,
     )
+
     return result
 
 
 def encode_video_latent(vae, image):
     image_tensor = F_vision.pil_to_tensor(image).float() / 127.5 - 1.0
+
     image_tensor = (
         image_tensor.unsqueeze(0).unsqueeze(2).repeat(1, 1, NUM_FRAMES, 1, 1)
     ).to("cuda", dtype=torch.bfloat16)
@@ -625,28 +880,34 @@ def encode_video_latent(vae, image):
     #
     #   latents = (latents - latents_mean) * scaling_factor / latents_std
     #
-    # (ver diffusers/pipelines/ltx2/pipeline_ltx2.py: _normalize_latents).
     # Sin este paso, el transformer (preentrenado sobre latentes YA
-    # normalizados) recibe un "clean" con escala/varianza equivocada:
-    # el objetivo de flow-matching (noise - clean) queda descalibrado
-    # y el modelo aprende a denoisear un dominio distinto del real.
-    latents_mean = vae.latents_mean.to(
-        device=latent.device, dtype=latent.dtype
-    ).view(1, -1, 1, 1, 1)
+    # normalizados) recibe un "clean" con escala/varianza equivocada.
+    latents_mean = getattr(vae, "latents_mean", None)
+    latents_std = getattr(vae, "latents_std", None)
 
-    latents_std = vae.latents_std.to(
-        device=latent.device, dtype=latent.dtype
-    ).view(1, -1, 1, 1, 1)
+    if latents_mean is not None and latents_std is not None:
+        latents_mean = latents_mean.to(
+            device=latent.device,
+            dtype=latent.dtype
+        ).view(1, -1, 1, 1, 1)
 
-    scaling_factor = float(getattr(vae.config, "scaling_factor", 1.0))
+        latents_std = latents_std.to(
+            device=latent.device,
+            dtype=latent.dtype
+        ).view(1, -1, 1, 1, 1)
 
-    latent = (latent - latents_mean) * scaling_factor / latents_std
+        scaling_factor = float(getattr(vae.config, "scaling_factor", 1.0))
+
+        latent = (latent - latents_mean) * scaling_factor / latents_std
 
     return latent.detach().to(torch.bfloat16).cpu().contiguous()
 
 
 def make_audio_latent(video_latent, audio_channels):
-    return torch.zeros((video_latent.shape[0], audio_channels, 1), dtype=torch.bfloat16)
+    return torch.zeros(
+        (video_latent.shape[0], audio_channels, 1),
+        dtype=torch.bfloat16
+    )
 
 
 # ============================================================================
@@ -654,11 +915,30 @@ def make_audio_latent(video_latent, audio_channels):
 # ============================================================================
 
 def preprocess_ltx23():
+    global MODEL_ID
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA no está disponible.")
 
+    # ------------------------------------------------------------------
+    # NUEVO: descargar modelo antes de buscar la carpeta local
+    # ------------------------------------------------------------------
+    MODEL_ID = ensure_ltx23_model_downloaded(MODEL_ID)
+
     if not os.path.isdir(MODEL_ID):
         raise FileNotFoundError(f"No existe el modelo: {MODEL_ID}")
+
+    if not os.path.exists(os.path.join(MODEL_ID, "model_index.json")):
+        raise FileNotFoundError(
+            f"Falta model_index.json en: {MODEL_ID}. "
+            "La descarga del modelo base puede haber quedado incompleta."
+        )
+
+    if not os.path.exists(os.path.join(MODEL_ID, "index.json")):
+        raise FileNotFoundError(
+            f"Falta index.json en: {MODEL_ID}. "
+            "La descarga del modelo NF4 puede haber quedado incompleta."
+        )
 
     os.makedirs(DATASET_PATH, exist_ok=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -695,6 +975,7 @@ def preprocess_ltx23():
     # Cargar pipeline en CPU (SIN .to("cuda")).
     # ------------------------------------------------------------------
     print()
+
     if TEXT_ENCODER_4BIT:
         print("Cargando LTX-2.3 en CPU (sin transformer y SIN text encoders)...")
     else:
@@ -710,6 +991,7 @@ def preprocess_ltx23():
 
     for te_name in list_text_encoder_components(pipe):
         te_obj = getattr(pipe, te_name, None)
+
         if te_obj is None:
             print("{}: None (se cargara cuantizado)".format(te_name))
         else:
@@ -731,6 +1013,7 @@ def preprocess_ltx23():
     # ------------------------------------------------------------------
     if used_4bit:
         vae = getattr(pipe, "vae", None)
+
         if vae is not None:
             vae.to("cuda")
 
@@ -739,8 +1022,10 @@ def preprocess_ltx23():
             _patch_module_to_noop_device(getattr(pipe, attr, None))
 
         text_device = "cuda"
+
         print("[OFFLOAD] 4bit activo -> text encoder(s) 4-bit + VAE en VRAM.")
         print("[VRAM] tras 4bit + VAE: {:.2f} GB".format(vram_gb()))
+
     else:
         text_device = setup_offload(pipe, PRECACHE_OFFLOAD)
 
@@ -750,6 +1035,7 @@ def preprocess_ltx23():
     # NEGATIVE PROMPT
     # ------------------------------------------------------------------
     print("\nEncoding negative/empty prompt...")
+
     with torch.inference_mode():
         neg_result = encode_prompt(pipe, "", text_device)
 
@@ -768,6 +1054,7 @@ def preprocess_ltx23():
     # ------------------------------------------------------------------
     if PREVIEW_CUSTOM_PROMPT:
         custom_prompt = PREVIEW_CUSTOM_PROMPT
+
         if TRIGGER_WORD and TRIGGER_WORD.lower() not in custom_prompt.lower():
             custom_prompt = f"{TRIGGER_WORD}, {custom_prompt}".strip(", ")
 
@@ -804,6 +1091,7 @@ def preprocess_ltx23():
         image = Image.open(os.path.join(DATASET_PATH, filename)).convert("RGB")
 
         bw, bh = bucket_size(image.width, image.height)
+
         scale = max(bw / image.width, bh / image.height)
 
         image = image.resize(
@@ -813,21 +1101,25 @@ def preprocess_ltx23():
 
         left = (image.width - bw) // 2
         top = (image.height - bh) // 2
+
         image = image.crop((left, top, left + bw, top + bh))
 
         print("Bucket:", f"{bw}x{bh}")
 
         # VIDEO VAE
         print("Encoding video latent...")
+
         with torch.inference_mode():
             video_latent = encode_video_latent(pipe.vae, image)
 
         torch.save(video_latent, video_path)
+
         print("Video latent:", tuple(video_latent.shape))
 
         # AUDIO LATENT
         audio_latent = make_audio_latent(video_latent, audio_channels)
         torch.save(audio_latent, audio_path)
+
         print("Audio latent:", tuple(audio_latent.shape))
 
         # TEXT
