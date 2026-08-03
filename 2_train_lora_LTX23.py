@@ -912,8 +912,8 @@ def prepare_text_conditioning(entries, connectors, max_text_tokens=0):
         if connectors is None:
             raise RuntimeError("Faltan textos precomputados y no hay connectors.")
 
-        print()
-        print("Precomputando text conditioning para {} entradas...".format(len(missing)))
+        #print()
+        #print("Precomputando text conditioning para {} entradas...".format(len(missing)))
 
         connectors.to("cuda")
         connectors.eval()
@@ -990,8 +990,8 @@ def prepare_special_text_conditioning(connectors, max_text_tokens, preview_custo
     ]
 
     if missing and connectors is not None:
-        print()
-        print("Precomputando textos especiales para preview:")
+        #print()
+        #print("Precomputando textos especiales para preview:")
 
         for prefix in missing:
             print("  - {}".format(prefix))
