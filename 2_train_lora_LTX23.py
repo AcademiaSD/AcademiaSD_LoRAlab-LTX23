@@ -2632,7 +2632,7 @@ def train_ltx23():
 
     print()
     print("STARTING TRAINING / ARRANCANDO ENTRENAMIENTO! {} entradas cacheadas.".format(len(entries)))
-    print("LoRA export prefix / Prefijo de exportación: '{}'".format(LORA_KEY_PREFIX))
+    #print("LoRA export prefix / Prefijo de exportación: '{}'".format(LORA_KEY_PREFIX))
 
     try:
         for step in range(start_step + 1, TOTAL_STEPS + 1):
@@ -2901,7 +2901,7 @@ def train_ltx23():
     save_lora(model, final_path)
 
     print("Final LoRA saved to / Tu LoRA definitivo está en: {}".format(final_path))
-    print("Formato exportado: prefijo='{}', scaling horneado -> usa strength=1.0 en ComfyUI.".format(LORA_KEY_PREFIX))
+    #print("Formato exportado: prefijo='{}', scaling horneado -> usa strength=1.0 en ComfyUI.".format(LORA_KEY_PREFIX))
 
     for hook in hooks:
         try:
