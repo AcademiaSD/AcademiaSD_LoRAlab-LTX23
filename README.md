@@ -20,7 +20,7 @@ https://www.youtube.com/watch?v=cEnZH-Eh7Rs
 
 ## 🔬 Technical Deep-Dive: Why is it so fast, light, & high quality?
 
-Training a 12-Billion parameter Diffusion Transformer (DiT) like **Krea 2** typically requires enterprise-grade hardware (30GB+ VRAM, 64GB+ System RAM) and hours of compute. **AcademiaSD LTX2.3 LoRAlab** breaks this barrier, allowing training on consumer GPUs (8GB–12GB VRAM) in record time while preserving 100% of the model's generation quality. 
+Training a 22-Billion parameter Diffusion Transformer (DiT) like **LTX-2.3** typically requires enterprise-grade hardware (30GB+ VRAM, 64GB+ System RAM) and hours of compute. **AcademiaSD LoRAlab LTX 2.3** breaks this barrier, allowing training on consumer GPUs (12GB-16GB VRAM) in record time while preserving 100% of the model's generation quality. 
 
 Here is the exact architectural breakdown of how this is achieved:
 
@@ -28,8 +28,8 @@ Here is the exact architectural breakdown of how this is achieved:
 
 ### 1. 📉 VRAM Usage is Reduced to ~12 GB
 
-* **4-Bit NormalFloat (NF4) Quantization (`bitsandbytes`)**: The 12-Billion parameter DiT backbone is quantized into 4-bit NF4 weights (`Linear4bit`). Base weights are frozen and pinned to CUDA memory, compressing the 12B model footprint from ~24 GB down to ~6.5 GB.
-* **Zero VRAM Wasted on Encoders (Offline Pre-Caching)**: During training (`2_train_lora_ltx23.py`), **neither the Text Encoder (Qwen3-VL-4B) nor the VAE are loaded into VRAM**. All text embeddings and image latents are pre-computed once during the pre-cache stage and stored on disk.
+* **4-Bit NormalFloat (NF4) Quantization (`bitsandbytes`)**: The 22-Billion parameter DiT backbone is quantized into 4-bit NF4 weights (`Linear4bit`). Base weights are frozen and pinned to CUDA memory, compressing the 22B model footprint from ~35 GB down to ~9 GB.
+* **Zero VRAM Wasted on Encoders (Offline Pre-Caching)**: During training (`2_train_lora_ltx23.py`), **neither the Text Encoder nor the VAE are loaded into VRAM**. All text embeddings and image latents are pre-computed once during the pre-cache stage and stored on disk.
 * **8-Bit AdamW Optimizer (`bitsandbytes.optim.AdamW8bit`)**: Optimizer states are stored in 8-bit precision instead of 32-bit float, cutting optimizer VRAM overhead by 75%.
 * **Gradient Checkpointing**: Intermediate activation tensors are recomputed during backward passes rather than stored in memory, keeping activation VRAM flat regardless of resolution.
 
@@ -45,16 +45,16 @@ Here is the exact architectural breakdown of how this is achieved:
 
 ### 3. 🎨 Why Generation Quality is 100% Preserved
 
-* **Exact Channel-Wise VAE Normalization**: Qwen-Image VAE uses specific channel-wise mean and standard deviation tensors (`latents_mean`, `latents_std`). Our pre-caching applies exact channel normalization `(z - mean) / std`, ensuring latent distributions match Krea-2's pre-trained space down to the float.
+* **Exact Channel-Wise VAE Normalization**: VAE uses specific channel-wise mean and standard deviation tensors (`latents_mean`, `latents_std`). Our pre-caching applies exact channel normalization `(z - mean) / std`, ensuring latent distributions match LTX-2.3s pre-trained space down to the float.
 * **Full-Layer Target Coverage**: LoRA adapters target **all** `Linear` and `Linear4bit` modules across the DiT architecture, enabling deep feature learning (concepts, styles, faces, lighting) rather than surface-level overfitting.
-* **Native Krea-2 Noise Shift Schedule**: Implements Krea-2's exact mathematical noise shift function (`calculate_shift`) and logit-normal/shifted timestep sampling (`sample_sigma`), preserving the true velocity-matching diffusion trajectories.
+* **Native LTX 2.3 Noise Shift Schedule**: Implements LTX 2.3's exact mathematical noise shift function (`calculate_shift`) and logit-normal/shifted timestep sampling (`sample_sigma`), preserving the true velocity-matching diffusion trajectories.
 
 ---
 
 ## ✨ Features
 
 - **🌐 Modern Web GUI**: Control pre-caching, dataset editing, training, checkpointing, and model export from a sleek single-page web app powered by Flask.
-- **🚀 1-Click Auto Launch**: Double-click `Run_LoRAlab-Krea2.bat` to automatically launch the server and open `http://127.0.0.1:5000` in your default browser.
+- **🚀 1-Click Auto Launch**: Double-click `Run_LoRAlab-LTX23.bat` to automatically launch the server and open `http://127.0.0.1:5000` in your default browser.
 - **📊 Real-Time Hardware Telemetry**:
   - System **RAM** usage.
   - Physical **GPU VRAM** usage (via `nvidia-smi` / `torch`).
@@ -66,8 +66,8 @@ Here is the exact architectural breakdown of how this is achieved:
   - Modal lightbox to view high-res images and **edit `.txt` captions directly on disk**.
   - Batch tool to inject **Trigger Words** across all captions at once.
 - **⏱️ Exact Step Resume Checkpoints**: Interrupt or stop training at any step (e.g. Step 333); the exact state (`current_step.txt`, `optimizer.pt`, `adapter_model.safetensors`) is saved automatically. Click **Start/Resume** to continue from that exact step.
-- **📂 Automatic Project Folder Management**: Dynamically routes cache and outputs to `./cached_data_krea2_<project>` and `./krea2_lora_output_<project>` based on your project name.
-- **🚀 One-Click WebUI Export ("Send to Models")**: Export the best `.safetensors` LoRA directly to your preferred WebUI folder (ComfyUI, Forge, Automatic1111).
+- **📂 Automatic Project Folder Management**: Dynamically routes cache and outputs to `./cached_data_LTX23_<project>` and `./LTX23_lora_output_<project>` based on your project name.
+- **🚀 One-Click WebUI Export ("Send to Models")**: Export the best `.safetensors` LoRA directly to your preferred WebUI folder (ComfyUI, ForgeNeo, etc.).
 - **🌐 Fully Bilingual (English / Español)**: All buttons, console logs, dialogs, and progress bars display labels in both English and Spanish.
 
 ---
@@ -76,8 +76,8 @@ Here is the exact architectural breakdown of how this is achieved:
 
 | Requirement | Minimum | Recommended |
 | :--- | :--- | :--- |
-| **OS** | Windows 10/11 or Linux | Windows 11 / Ubuntu 22.04 |
-| **GPU** | NVIDIA GPU with **8 GB VRAM** | NVIDIA GPU with **12 GB–24 GB VRAM** |
+| **OS** | Windows 10/11 |
+| **GPU** | NVIDIA GPU with **12 GB VRAM** | NVIDIA GPU with **12 GB–24 GB VRAM** |
 | **Python** | Python 3.10+ (inside `venv`) | Python 3.10 / 3.11 |
 | **CUDA Toolkit** | CUDA 11.8 or 12.1+ | CUDA 12.1+ |
 
@@ -88,17 +88,17 @@ Here is the exact architectural breakdown of how this is achieved:
 1. **Clone or download the repository**:
    ```bash
    git clone https://github.com/AcademiaSD/AcademiaSD-LoRAlab-LTX23.git
-   cd AcademiaSD-LTX23-LoRAlab
+   cd AcademiaSD-LoRAlab-LTX23
    ```
 
 2. **Install virtual environment & dependencies**:
-   Double-click `Install_LoRAlab-LTX23.bat` to automatically set up the Python virtual environment (`venv`) and install all required core libraries.
+   Double-click `Install_LoRAlab-venv.bat` to automatically set up the Python virtual environment (`venv`) and install all required core libraries.
 
 3. **(Optional) Install Triton & SageAttention 2.2**:
    Double-click `Install_Triton&SageAtten220.bat` to install Triton and SageAttention 2.2 for enhanced attention speedup and memory optimization.
 
 4. **Update the application**:
-   You can check for and apply updates at any time by running `Update_LoRAlab-Krea2.bat`.
+   You can check for and apply updates at any time by running `Update_LoRAlab-LTX23.bat`.
 
 ---
 
@@ -107,7 +107,7 @@ Here is the exact architectural breakdown of how this is achieved:
 ### 1. Launch the Application
 Simply double-click the launcher:
 ```cmd
-Run_LoRAlab-Krea2.bat
+Run_LoRAlab-LTX23.bat
 ```
 The server will start, and your web browser will automatically open `http://127.0.0.1:5000`.
 
@@ -123,7 +123,7 @@ Update_LoRAlab-LTX23.bat
 4. Click **Start Pre-Cache / Iniciar Pre-Caché**.
 
 ### 3. Train LoRA
-1. Configure **Total Steps** (e.g., `1200`), **Learning Rate** (e.g., `0.0003`), **LoRA Rank/Alpha**, and **Save Every**.
+1. Configure **Total Steps** (e.g., `1200`), **Learning Rate** (e.g., `0.0001`), **LoRA Rank/Alpha**, and **Save Every**.
 2. Click **Start / Resume**.
 3. You can stop training at any time by clicking **Stop Training**; exact step state will be saved automatically for seamless resuming.
 
@@ -137,7 +137,7 @@ Update_LoRAlab-LTX23.bat
 ## 📁 Project Structure
 
 ```text
-AcademiaSD_Krea2_LoRAlab/
+AcademiaSD_LoRAlab-LTX23/
 ├── assets/
 │   ├── banner.png             # Web GUI top header banner
 │   └── logo.png               # Logo & browser favicon
@@ -145,8 +145,8 @@ AcademiaSD_Krea2_LoRAlab/
 ├── 2_train_lora_krea2.py       # DiT 12B NF4 LoRA training script
 ├── server.py                   # Flask backend web server
 ├── trainer_ui.html             # HTML5 / CSS3 / JS Web GUI
-├── Run_LoRAlab-Krea2.bat       # Windows 1-click launcher
-├── Update_LoRAlab-Krea2.bat    # Updater
+├── Run_LoRAlab-LTX23.bat       # Windows 1-click launcher
+├── Update_LoRAlab-LTX23.bat    # Updater
 ├── pre_cache_settings.json     # Active pre-cache configuration
 ├── train_settings.json         # Active training configuration
 └── HF_token.json               # Optional Hugging Face access token
