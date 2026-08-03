@@ -111,7 +111,7 @@ Run_LoRAlab-Krea2.bat
 ```
 The server will start, and your web browser will automatically open `http://127.0.0.1:5000`.
 
-Unpate LoRAlab-LTX2.3.
+Double-click the Updater LoRAlab-LTX2.3.
 ```cmd
 Update_LoRAlab-LTX23.bat
 ```
