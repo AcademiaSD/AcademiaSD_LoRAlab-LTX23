@@ -6,6 +6,8 @@
   <b>An ultra-fast, low-resource Web GUI & pipeline for training LTX 2.3 LoRAs.</b>
 </p>
 
+> **LTX-2.5:** this trainer is also compatible with LTX-2.5. / Este entrenador también es compatible con LTX-2.5.
+
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python Version">
   <img src="https://img.shields.io/badge/PyTorch-2.0%2B-orange.svg" alt="PyTorch">
