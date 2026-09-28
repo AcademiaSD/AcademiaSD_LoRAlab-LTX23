@@ -1,6 +1,6 @@
 # AcademiaSD LoRAlab-LTX-2.3 Beta v0.93
 
-![AcademiaSD_LoRAlab-Krea2](assets/portada.jpg)
+![AcademiaSD_LoRAlab-LTX23](assets/portada.jpg)
 
 <p align="center">
   <b>An ultra-fast, low-resource Web GUI & pipeline for training LTX 2.3 LoRAs.</b>

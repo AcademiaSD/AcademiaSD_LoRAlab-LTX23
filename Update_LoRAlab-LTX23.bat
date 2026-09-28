@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-title AcademiaSD - Krea-2 LoRA Trainer Updater
+title AcademiaSD - LTX-2.3 LoRAlab Updater
 color 0B
 
 cd /d "%~dp0"

@@ -1,56 +1,39 @@
 @echo off
+setlocal EnableExtensions
+title AcademiaSD - LTX-2.3 NF4 Converter
+
+rem Los scripts usan rutas relativas a la raiz del LoRAlab (venv, LTX23-Raw, LTX23-NF4_weights).
+cd /d "%~dp0.."
 call venv\Scripts\activate.bat
-echo ====================================================
-echo   GESTOR DE ENTRENAMIENTO LORA	EN LOCAL LTX23
-echo ====================================================
 
 :menu
 echo.
-echo Selecciona una opcion:
-echo 1. Pre-procesar Dataset (Convertir a Latentes)
-echo 2. Iniciar / Continuar Entrenamiento LoRA
-echo 3. Descargar LTX23 Raw
-echo 4. Salir
-echo 5. Convertir Raw a NF4
+echo ====================================================
+echo   ACADEMIASD - LTX-2.3 NF4 CONVERTER
+echo ====================================================
+echo 1. Descargar LTX-2.3 Raw / Download LTX-2.3 Raw (.\LTX23-Raw)
+echo 2. Convertir Raw a NF4 / Convert Raw to NF4 (.\LTX23-NF4_weights)
+echo 3. Salir / Exit
 echo.
+set "opcion="
+set /p opcion="Elige una opcion / Choose an option (1-3): "
+rem Sin respuesta (Enter o entrada cerrada) se sale: evita repetir el menu sin fin.
+if not defined opcion goto fin
 
-set /p opcion="Elige una opcion (1-4): "
-
-if "%opcion%"=="1" goto preprocesar
-if "%opcion%"=="2" goto entrenar
-if "%opcion%"=="3" goto descarga
-if "%opcion%"=="4" goto fin
-if "%opcion%"=="5" goto convertir
-
-:preprocesar
-echo Ejecutando generacion de latentes...
-python 1_pre_cache_krea2.py
-pause
-goto menu
-
-:entrenar
-echo Iniciando el entrenador (Si existe un punto de guardado, continuara)...
-python 2_train_lora_krea2.py
-pause
-goto menu
-
-:fix
-echo Arreglando los keys del LoRA...
-python 3_arreglar_lora.py
-pause
+if "%opcion%"=="1" goto descarga
+if "%opcion%"=="2" goto convertir
+if "%opcion%"=="3" goto fin
 goto menu
 
 :descarga
-echo Comenzando la descarga en Local...
-python 4_descarga_LTX23.py
+python tools\4_descarga_LTX23.py
 pause
 goto menu
 
 :convertir
-echo Convertir Raw a NF4...
-python 5_conversor_LTX23_NF4.py
+python tools\5_conversor_LTX23_NF4.py
 pause
 goto menu
 
 :fin
-echo Saliendo...
+endlocal

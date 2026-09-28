@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 
-title AcademiaSD - Krea-2 LoRA Trainer
+title AcademiaSD - LTX-2.3 LoRAlab Trainer
 
 cd /d "%~dp0"
 
@@ -10,7 +10,7 @@ set "PYTHON_EXE="
 
 echo.
 echo ================================================================
-echo        ACADEMIASD - KREA-2 LORA TRAINER
+echo        ACADEMIASD - LTX-2.3 LORALAB TRAINER
 echo ================================================================
 echo.
 echo Carpeta del entrenador:

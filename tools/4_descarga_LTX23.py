@@ -5,7 +5,7 @@ import os
 # CONFIGURACIÓN DE DESTINO
 # Pon la ruta de tu disco secundario aquí:
 # ==========================================
-DIRECTORIO_DESTINO = "./LTX-23-RAW"
+DIRECTORIO_DESTINO = "./LTX23-Raw"  # la misma carpeta que lee 5_conversor_LTX23_NF4.py
 
 os.makedirs(DIRECTORIO_DESTINO, exist_ok=True)
 
