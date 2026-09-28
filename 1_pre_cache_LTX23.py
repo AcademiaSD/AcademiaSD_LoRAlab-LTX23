@@ -278,14 +278,20 @@ def ensure_ltx23_model_downloaded(local_path):
 
     if has_base and has_nf4:
         print(f"[OK] Modelo local encontrado en / Local model found at: {local_path}")
+        if not os.path.exists(os.path.join(local_path, "text_encoder_NF4", "config.json")):
+            # Instalaciones anteriores traían el text encoder en FP32 en vez del NF4 ya cuantizado.
+            from huggingface_hub import snapshot_download
+            print("Downloading / Descargando: {}/text_encoder_NF4 (~8 GB)".format(HF_NF4_REPO_ID))
+            snapshot_download(repo_id=HF_NF4_REPO_ID, local_dir=local_path, token=get_hf_token(),
+                              max_workers=4, allow_patterns=["text_encoder_NF4/*"])
         return local_path
 
     print()
     print("=" * 80)
     print("WARNING / ATENCIÓN")
     print("=" * 80)
-    print("This will download about 75 GB. This may take several minutes.")
-    print("Esto descargará unos 75 GB. Esto puede tardar varios minutos.")
+    print("This will download about 32 GB. This may take several minutes.")
+    print("Esto descargará unos 32 GB. Esto puede tardar varios minutos.")
     print("=" * 80)
 
     auto = os.environ.get("LTX_AUTO_CONFIRM_DOWNLOAD", "0").strip().lower()
@@ -309,14 +315,14 @@ def ensure_ltx23_model_downloaded(local_path):
     os.makedirs(local_path, exist_ok=True)
 
     print()
-    # El Transformer BF16 (~38 GB) no se usa: sale entero del repo NF4.
+    # El Transformer BF16 (~38 GB) y el text encoder FP32 (~49 GB) no se usan: salen ya cuantizados del repo NF4.
     print("Downloading / Descargando:", HF_BASE_REPO_ID)
     snapshot_download(
         repo_id=HF_BASE_REPO_ID,
         local_dir=local_path,
         token=token,
         max_workers=4,
-        ignore_patterns=["transformer/*"],
+        ignore_patterns=["transformer/*", "text_encoder/*"],
     )
 
     print()
@@ -633,12 +639,19 @@ def quantize_one_text_encoder_4bit(pipe, component_name):
         )
     )
 
+    # text_encoder_NF4/ es este mismo text encoder ya cuantizado con bnb_cfg (salidas idénticas):
+    # se carga tal cual, sin leer ni descargar el FP32 de ~49 GB.
+    prequantized = component_name + "_NF4"
+    if os.path.exists(os.path.join(MODEL_ID, prequantized, "config.json")):
+        base_kwargs = {"subfolder": prequantized}
+    else:
+        base_kwargs = {"subfolder": component_name, "quantization_config": bnb_cfg}
+
     for label, extra_kwargs in strategies:
         kwargs = {
-            "quantization_config": bnb_cfg,
             "torch_dtype": torch.bfloat16,
             "low_cpu_mem_usage": True,
-            "subfolder": component_name,
+            **base_kwargs,
         }
         kwargs.update(extra_kwargs)
 

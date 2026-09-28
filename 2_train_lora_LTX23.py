@@ -332,8 +332,8 @@ def ensure_ltx23_model_downloaded(local_path):
     print("=" * 80)
     print("WARNING / ATENCIÓN")
     print("=" * 80)
-    print("This will download about 75 GB. This may take several minutes.")
-    print("Esto descargará unos 75 GB. Esto puede tardar varios minutos.")
+    print("This will download about 32 GB. This may take several minutes.")
+    print("Esto descargará unos 32 GB. Esto puede tardar varios minutos.")
     print("=" * 80)
 
     auto = os.environ.get("LTX_AUTO_CONFIRM_DOWNLOAD", "0").strip().lower()
@@ -354,7 +354,7 @@ def ensure_ltx23_model_downloaded(local_path):
 
     os.makedirs(local_path, exist_ok=True)
 
-    # El Transformer BF16 (~38 GB) no se usa: sale entero del repo NF4.
+    # El Transformer BF16 (~38 GB) y el text encoder FP32 (~49 GB) no se usan: salen ya cuantizados del repo NF4.
     print()
     print("Downloading / Descargando:", HF_BASE_REPO_ID)
     snapshot_download(
@@ -362,7 +362,7 @@ def ensure_ltx23_model_downloaded(local_path):
         local_dir=local_path,
         token=token,
         max_workers=4,
-        ignore_patterns=["transformer/*"],
+        ignore_patterns=["transformer/*", "text_encoder/*"],
     )
 
     print()

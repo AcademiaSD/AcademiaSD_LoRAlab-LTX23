@@ -103,7 +103,7 @@ Here is the exact architectural breakdown of how this is achieved:
 4. **Update the application**:
    You can check for and apply updates at any time by running `Update_LoRAlab-LTX23.bat`.
 
-> **Model download:** the transformer is loaded only from the NF4 repo `AcademiaSD/LTX23_NF4`; the BF16 `transformer/` of `diffusers/LTX-2.3-Diffusers` (~38 GB) is no longer downloaded. **Updating from v0.76:** the first training downloads `LTX23-NF4/others.safetensors` (13 MB) and you can delete the old folder `LTX23-NF4/transformer`.
+> **Model download (~32 GB):** the transformer and the Gemma 3 text encoder come already quantized from the NF4 repo `AcademiaSD/LTX23_NF4`; the BF16 `transformer/` (~38 GB) and the FP32 `text_encoder/` (~49 GB) of `diffusers/LTX-2.3-Diffusers` are no longer downloaded. The embeddings are identical to the ones before. **Updating:** the first Pre-Cache downloads `LTX23-NF4/text_encoder_NF4` (~8 GB) and the first training `LTX23-NF4/others.safetensors` (13 MB); then you can delete the old folders `LTX23-NF4/transformer` and `LTX23-NF4/text_encoder`.
 
 ---
 
