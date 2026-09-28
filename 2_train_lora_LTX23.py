@@ -35,7 +35,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from diffusers import DiffusionPipeline
+from accelerate import init_empty_weights
+from diffusers import DiffusionPipeline, LTX2VideoTransformer3DModel
+from diffusers.configuration_utils import FrozenDict
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -330,8 +332,8 @@ def ensure_ltx23_model_downloaded(local_path):
     print("=" * 80)
     print("WARNING / ATENCIÓN")
     print("=" * 80)
-    print("This will download more than 100 GB. This may take several minutes.")
-    print("Esto descargará más de 100 GB. Esto puede tardar varios minutos.")
+    print("This will download about 75 GB. This may take several minutes.")
+    print("Esto descargará unos 75 GB. Esto puede tardar varios minutos.")
     print("=" * 80)
 
     auto = os.environ.get("LTX_AUTO_CONFIRM_DOWNLOAD", "0").strip().lower()
@@ -352,6 +354,7 @@ def ensure_ltx23_model_downloaded(local_path):
 
     os.makedirs(local_path, exist_ok=True)
 
+    # El Transformer BF16 (~38 GB) no se usa: sale entero del repo NF4.
     print()
     print("Downloading / Descargando:", HF_BASE_REPO_ID)
     snapshot_download(
@@ -359,6 +362,7 @@ def ensure_ltx23_model_downloaded(local_path):
         local_dir=local_path,
         token=token,
         max_workers=4,
+        ignore_patterns=["transformer/*"],
     )
 
     print()
@@ -373,6 +377,16 @@ def ensure_ltx23_model_downloaded(local_path):
     print()
     print("[OK] Modelo descargado en: {}".format(local_path))
     return local_path
+
+
+def ensure_nf4_others_downloaded(local_path):
+    if os.path.exists(os.path.join(local_path, "others.safetensors")):
+        return
+
+    from huggingface_hub import hf_hub_download
+
+    print("Downloading / Descargando: {}/others.safetensors".format(HF_NF4_REPO_ID))
+    hf_hub_download(repo_id=HF_NF4_REPO_ID, filename="others.safetensors", local_dir=local_path, token=get_hf_token())
 
 
 # ===========================================================================
@@ -450,13 +464,21 @@ def filter_forward_kwargs(kwargs, forward_fn):
 # ===========================================================================
 # NF4 CACHE
 # ===========================================================================
-def load_nf4_cache_(transformer, cache_dir):
+def load_nf4_transformer(cache_dir):
+    """
+    Construye el Transformer vacío desde config.json y lo rellena con la caché NF4
+    (weights/ + others.safetensors). No hace falta el Transformer en BF16.
+    Builds the empty Transformer from config.json and fills it from the NF4 cache.
+    """
     index_path = os.path.join(cache_dir, "index.json")
     if not os.path.exists(index_path):
         raise FileNotFoundError("No existe index.json: {}".format(index_path))
 
     with open(index_path, "r", encoding="utf-8") as f:
         index = json.load(f)
+
+    with init_empty_weights():
+        transformer = LTX2VideoTransformer3DModel.from_config(LTX2VideoTransformer3DModel.load_config(cache_dir))
 
     quantized = index.get("quantized", {})
     unquantized = index.get("unquantized", {})
@@ -487,13 +509,15 @@ def load_nf4_cache_(transformer, cache_dir):
             for key, value in qs_dict.items():
                 packed_qs[key] = value
 
-        new_layer = Linear4bit(
-            int(info["in_features"]),
-            int(info["out_features"]),
-            bias=info.get("bias", False),
-            quant_type="nf4",
-            compute_dtype=torch.bfloat16,
-        )
+        # En meta: nn.Linear.__init__ reservaría y rellenaría una matriz FP32 que se tira en seguida.
+        with torch.device("meta"):
+            new_layer = Linear4bit(
+                int(info["in_features"]),
+                int(info["out_features"]),
+                bias=info.get("bias", False),
+                quant_type="nf4",
+                compute_dtype=torch.bfloat16,
+            )
 
         new_weight = Params4bit.from_prequantized(
             data=weight_data,
@@ -527,17 +551,25 @@ def load_nf4_cache_(transformer, cache_dir):
             if info.get("bias", False):
                 bias = f.get_tensor("bias")
 
-        layer = torch.nn.Linear(
-            int(info["in_features"]),
-            int(info["out_features"]),
-            bias=info.get("bias", False),
-        )
+        with torch.device("meta"):
+            layer = torch.nn.Linear(
+                int(info["in_features"]),
+                int(info["out_features"]),
+                bias=info.get("bias", False),
+            )
 
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
         if bias is not None:
             layer.bias = torch.nn.Parameter(bias, requires_grad=False)
 
         setattr(parent, child_name, layer)
+
+    # Normas, tablas de modulación, etc.: en BF16, como los daba from_pretrained.
+    transformer.load_state_dict(load_file(os.path.join(cache_dir, "others.safetensors")), strict=False, assign=True)
+
+    missing = [n for n, t in list(transformer.named_parameters()) + list(transformer.named_buffers()) if t.is_meta]
+    if missing:
+        raise RuntimeError("Caché NF4 incompleta / NF4 cache incomplete: {}".format(missing[:5]))
 
     verified = 0
     for _, module in transformer.named_modules():
@@ -1358,12 +1390,52 @@ def restore_preview_lora_scale(model):
 # ===========================================================================
 # EXPORT LoRA
 # ===========================================================================
-def save_lora(model, path, prefix=None):
-    if prefix is None:
-        prefix = LORA_KEY_PREFIX
+def build_lora_metadata(step):
+    """
+    Cabecera del .safetensors: no cambia ningún peso. Claves legibles más la convención
+    ss_* de kohya-ss, que es lo que leen CivitAI y los gestores de LoRAs para rellenar la
+    ficha. CivitAI saca las palabras de activación de ss_tag_frequency ({carpeta: {tag: veces}}).
+    """
+    meta = {
+        "trained_with": "AcademiaSD LoRAlab LTX-2.3",
+        "ss_sd_model_name": "LTX-2.3",
+        "ss_base_model_version": "LTX-2.3",
+        "ss_network_module": "peft.LoraModel",
+        "ss_network_dim": LORA_RANK,
+        "ss_network_alpha": LORA_ALPHA,
+        "ss_learning_rate": LR,
+        "ss_lr_scheduler": "cosine_with_warmup",
+        "ss_lr_warmup_steps": WARMUP_STEPS,
+        "ss_max_train_steps": TOTAL_STEPS,
+        "ss_steps": step,
+        "ss_batch_size_per_device": BATCH_SIZE,
+        "ss_gradient_accumulation_steps": GRAD_ACCUM_STEPS,
+        "ss_seed": SEED,
+        "ss_mixed_precision": "bf16",
+    }
 
-    if prefix is None:
-        prefix = ""
+    if TRIGGER_WORD:
+        meta["trigger_word"] = TRIGGER_WORD
+        meta["ss_tag_frequency"] = json.dumps({"dataset": {TRIGGER_WORD: 1}})
+    if PROJECT_NAME:
+        meta["project_name"] = PROJECT_NAME
+    meta["ss_output_name"] = PROJECT_NAME or TRIGGER_WORD or "ltx23_lora"
+
+    # La resolución la fija el pre-caché del proyecto.
+    pc_json = os.path.join(CACHE_DIR, "pre_cache_settings_{}.json".format(PROJECT_NAME))
+    if os.path.exists(pc_json):
+        with open(pc_json, "r", encoding="utf-8") as f:
+            area = json.load(f).get("target_area")
+        if area:
+            side = int(round(float(area) ** 0.5))
+            meta["ss_resolution"] = "({},{})".format(side, side)
+
+    # safetensors exige que todos los valores sean str.
+    return {k: str(v) for k, v in meta.items()}
+
+
+def save_lora(model, path, step):
+    prefix = LORA_KEY_PREFIX or ""
 
     scaling = float(LORA_ALPHA) / float(max(1, LORA_RANK))
 
@@ -1392,6 +1464,7 @@ def save_lora(model, path, prefix=None):
             "format": "ltx23_lora",
             "lora_key_prefix": prefix,
             "baked_scaling": "{:.6f}".format(scaling),
+            **build_lora_metadata(step),
         },
     )
 
@@ -2000,6 +2073,59 @@ def reload_preview_settings():
         ))
 
 
+_live_mtime = None
+
+
+def reload_live_settings():
+    """
+    Ajustes en caliente: si train_settings.json ha cambiado (la GUI lo reescribe con
+    Save JSON aunque el entrenamiento esté en marcha), aplica la lista de abajo en el
+    paso siguiente. El coste por paso es un getmtime. El resto de ajustes de preview se
+    releen en cada preview; rank, alpha, resolución y carpetas necesitan Stop -> Resume.
+    """
+    global _live_mtime, TOTAL_STEPS, SAVE_EVERY, LR, MAX_GRAD_NORM
+    global PREVIEW_EVERY, PREVIEW_STEPS, PREVIEW_CFG, SEED
+
+    try:
+        mtime = os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        return []
+    if _live_mtime is None or mtime == _live_mtime:
+        # La primera llamada solo memoriza la fecha: el guardado previo al lanzamiento no es un cambio.
+        _live_mtime = _live_mtime or mtime
+        return []
+
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return []  # guardado a medias: se vuelve a intentar en el paso siguiente
+    _live_mtime = mtime
+
+    changes = []
+
+    def fresh(key, cast, current):
+        if key not in raw:
+            return current
+        try:
+            value = cast(raw[key])
+        except (TypeError, ValueError):
+            return current
+        if value != current:
+            changes.append("{}: {} -> {}".format(key, current, value))
+        return value
+
+    TOTAL_STEPS   = fresh("total_steps",   int,   TOTAL_STEPS)
+    SAVE_EVERY    = fresh("save_every",    int,   SAVE_EVERY)
+    LR            = fresh("lr",            float, LR)
+    MAX_GRAD_NORM = fresh("max_grad_norm", float, MAX_GRAD_NORM)
+    PREVIEW_EVERY = fresh("preview_every", int,   PREVIEW_EVERY)
+    PREVIEW_STEPS = fresh("preview_steps", int,   PREVIEW_STEPS)
+    PREVIEW_CFG   = fresh("preview_cfg",   float, PREVIEW_CFG)
+    SEED          = fresh("seed",          int,   SEED)  # solo previews
+    return changes
+
+
 def _fmt_num(x):
     try:
         f = float(x)
@@ -2308,6 +2434,7 @@ def train_ltx23():
     global CURRENT_TRANSFORMER
     global CURRENT_AUDIO_CHANNELS
     global ACTIVATION_OFFLOAD_ACTIVE
+    global LORA_RANK, LORA_ALPHA  # al reanudar se toman del checkpoint
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
@@ -2337,16 +2464,22 @@ def train_ltx23():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA no está disponible.")
 
+    if not os.path.exists(CACHE_DIR) or not any(f.endswith("_video_latent.pt") for f in os.listdir(CACHE_DIR)):
+        print("\n[!] ERROR: Cache directory '{}' is empty or does not exist.".format(CACHE_DIR))
+        print("[!] Please run Pre-Cache first! / ¡Por favor ejecuta el Pre-Caché primero!")
+        sys.exit(2)  # la GUI muestra este código como "falta la pre-caché"
+
     ensure_ltx23_model_downloaded(MODEL_ID)
 
-    if not os.path.exists(CACHE_DIR):
-        raise RuntimeError("No existe cache: {}.".format(CACHE_DIR))
+    # Instalaciones anteriores traían el Transformer en BF16 en vez de others.safetensors.
+    ensure_nf4_others_downloaded(MODEL_ID)
 
     print()
-    print("Loading LTX-2.3 Transformer... / Cargando Transformer de LTX-2.3...")
+    print("Loading LTX-2.3 connectors... / Cargando connectors de LTX-2.3...")
 
     pipe = DiffusionPipeline.from_pretrained(
         MODEL_ID,
+        transformer=None,
         vae=None,
         audio_vae=None,
         text_encoder=None,
@@ -2357,12 +2490,10 @@ def train_ltx23():
         low_cpu_mem_usage=True,
     )
 
-    transformer = pipe.transformer
     connectors = getattr(pipe, "connectors", None)
     scheduler = getattr(pipe, "scheduler", None)
 
-    CURRENT_CONFIG = transformer.config
-    CURRENT_TRANSFORMER = transformer
+    CURRENT_CONFIG = FrozenDict(LTX2VideoTransformer3DModel.load_config(MODEL_ID))
 
     AUDIO_CHANNELS = int(getattr(CURRENT_CONFIG, "audio_in_channels", 128))
     CURRENT_AUDIO_CHANNELS = AUDIO_CHANNELS
@@ -2386,29 +2517,25 @@ def train_ltx23():
     del pipe
     free_vram()
 
-    nf4_index = os.path.join(MODEL_ID, "index.json")
+    print()
+    print("Loading LTX-2.3 Transformer (NF4)... / Cargando Transformer de LTX-2.3 (NF4)...")
 
-    if os.path.exists(nf4_index):
-        print()
-        print("NF4 CACHE DETECTED! / CACHE NF4 DETECTADA!")
+    t0 = time.time()
 
-        t0 = time.time()
+    transformer = load_nf4_transformer(MODEL_ID)
+    CURRENT_CONFIG = transformer.config
+    CURRENT_TRANSFORMER = transformer
 
-        transformer = load_nf4_cache_(transformer, MODEL_ID)
-        CURRENT_TRANSFORMER = transformer
+    transformer.requires_grad_(False)
 
-        transformer.requires_grad_(False)
+    if CAST_FROZEN_BF16:
+        cast_frozen_to_bf16(transformer)
 
-        if CAST_FROZEN_BF16:
-            cast_frozen_to_bf16(transformer)
+    transformer.to("cuda")
+    free_vram()
 
-        transformer.to("cuda")
-        free_vram()
-
-        print("[NF4] Cache loaded in / Cache cargada en {:.1f}s".format(time.time() - t0))
-        print("Transformer pinned in VRAM. Usage / Uso: {:.1f} GB".format(torch.cuda.memory_allocated() / 1e9))
-    else:
-        raise RuntimeError("No existe caché NF4 en MODEL_ID.")
+    print("[NF4] Cache loaded in / Cache cargada en {:.1f}s".format(time.time() - t0))
+    print("Transformer pinned in VRAM. Usage / Uso: {:.1f} GB".format(torch.cuda.memory_allocated() / 1e9))
 
     enable_memory_efficient_attention(transformer)
 
@@ -2421,6 +2548,25 @@ def train_ltx23():
 
     target_modules = discover_lora_targets(transformer)
     print("Target LoRA Layers / Capas LoRA objetivo: {}".format(len(target_modules)))
+
+    # Reanudar es continuar EL MISMO LoRA: capas, rank y alpha salen del checkpoint, no de la GUI.
+    # Si se construyera con otros, el optimizador no encajaría y quedaría una mezcla de pesos.
+    # Las capas se leen de los PESOS guardados: adapter_config.json las guarda abreviadas.
+    resume_weights = os.path.join(RESUME_DIR, "adapter_model.safetensors")
+    if os.path.exists(STEP_FILE) and os.path.exists(resume_weights):
+        with safe_open(resume_weights, framework="pt", device="cpu") as f:
+            saved_targets = sorted({k.split(".lora_")[0].replace("base_model.model.", "", 1) for k in f.keys()})
+        with open(os.path.join(RESUME_DIR, "adapter_config.json"), "r", encoding="utf-8") as f:
+            saved_cfg = json.load(f)
+        saved = (len(saved_targets), saved_cfg["r"], saved_cfg["lora_alpha"])
+        if saved != (len(target_modules), LORA_RANK, LORA_ALPHA):
+            print("\n[!] Resuming with the checkpoint's LoRA: {} layers, rank {}, alpha {} "
+                  "(settings ask for {} layers, rank {}, alpha {}; they apply to new trainings).".format(
+                      *saved, len(target_modules), LORA_RANK, LORA_ALPHA))
+            print("[!] Se reanuda con el LoRA del checkpoint: {} capas, rank {}, alpha {} "
+                  "(los ajustes piden {} capas, rank {}, alpha {}; se aplican a entrenamientos nuevos).".format(
+                      *saved, len(target_modules), LORA_RANK, LORA_ALPHA))
+        target_modules, LORA_RANK, LORA_ALPHA = saved_targets, saved[1], saved[2]
 
     lora_config = LoraConfig(
         r=LORA_RANK,
@@ -2487,33 +2633,8 @@ def train_ltx23():
     start_step = 0
 
     adapter_path = os.path.join(RESUME_DIR, "adapter_model.safetensors")
-    adapter_cfg_path = os.path.join(RESUME_DIR, "adapter_config.json")
 
-    resume_compatible = True
-
-    if os.path.exists(adapter_cfg_path):
-        try:
-            with open(adapter_cfg_path, "r", encoding="utf-8") as f:
-                acfg = json.load(f)
-
-            saved_r = int(acfg.get("r", -1))
-            saved_alpha = int(acfg.get("lora_alpha", -1))
-
-            if saved_r != LORA_RANK:
-                resume_compatible = False
-
-                print("=" * 65)
-                print("[!] Checkpoint INCOMPATIBLE: rank guardado={}, rank actual={}.".format(
-                    saved_r, LORA_RANK
-                ))
-                print("    Al cambiar rank hay que entrenar desde 0.")
-                print("    Se IGNORA el checkpoint y se arranca limpio.")
-                print("    Borra resume_checkpoint/ y current_step.txt para limpiarlo.")
-                print("=" * 65)
-        except Exception:
-            pass
-
-    if resume_compatible and os.path.exists(adapter_path) and os.path.exists(STEP_FILE):
+    if os.path.exists(adapter_path) and os.path.exists(STEP_FILE):
         print("=" * 65)
         print("Checkpoint detected! Restoring state... / Checkpoint detectado! Restaurando estado...")
 
@@ -2571,7 +2692,7 @@ def train_ltx23():
 
         try:
             ckpt = os.path.join(OUTPUT_DIR, "LTX23_LoRA_step_{}.safetensors".format(current_s))
-            save_lora(model, ckpt)
+            save_lora(model, ckpt, current_s)
             print("Checkpoint saved successfully at step / Checkpoint guardado en paso {}: {}".format(current_s, ckpt))
         except Exception:
             pass
@@ -2634,10 +2755,22 @@ def train_ltx23():
     print("STARTING TRAINING / ARRANCANDO ENTRENAMIENTO! {} entradas cacheadas.".format(len(entries)))
     #print("LoRA export prefix / Prefijo de exportación: '{}'".format(LORA_KEY_PREFIX))
 
+    reload_live_settings()
+    step = start_step
     try:
-        for step in range(start_step + 1, TOTAL_STEPS + 1):
-            last_step_executed = step
+        # while y no range(): TOTAL_STEPS puede cambiar en caliente, en ambos sentidos.
+        while step < TOTAL_STEPS:
+            step += 1
 
+            changes = reload_live_settings()
+            if changes:
+                print("\n[LIVE] Settings reloaded without stopping / Ajustes recargados sin parar:")
+                for c in changes:
+                    print("[LIVE]   {}".format(c))
+                if step > TOTAL_STEPS:
+                    break
+
+            last_step_executed = step
             t0 = time.time()
 
             loss_video = None
@@ -2895,10 +3028,11 @@ def train_ltx23():
     print()
     print("Training completed! / Entrenamiento finalizado!")
 
-    save_checkpoint_now(TOTAL_STEPS)
+    # Pasos realmente entrenados: si se bajan los pasos en caliente por debajo del actual, se para aquí.
+    save_checkpoint_now(last_step_executed)
 
     final_path = os.path.join(OUTPUT_DIR, "LTX23_FINAL_LoRA.safetensors")
-    save_lora(model, final_path)
+    save_lora(model, final_path, last_step_executed)
 
     print("Final LoRA saved to / Tu LoRA definitivo está en: {}".format(final_path))
     #print("Formato exportado: prefijo='{}', scaling horneado -> usa strength=1.0 en ComfyUI.".format(LORA_KEY_PREFIX))

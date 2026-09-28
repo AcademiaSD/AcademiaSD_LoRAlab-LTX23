@@ -75,9 +75,14 @@ UI_FILE = BASE_DIR / "trainer_ui.html"
 LOGO_FILE = ASSETS_DIR / "logo.png" if (ASSETS_DIR / "logo.png").exists() else BASE_DIR / "logo.png"
 
 PRECACHE_CONFIG = BASE_DIR / "pre_cache_settings.json"
+PREVIEW_KEYS = ("preview_custom_prompt",)
 TRAIN_CONFIG = BASE_DIR / "train_settings.json"
 HF_TOKEN_CONFIG = BASE_DIR / "HF_token.json"
+CAPTION_CONFIG = BASE_DIR / "caption_settings.json"
 
+DATASET_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+CAPTION_SCRIPT = BASE_DIR / "0_caption_LTX23.py"
 PRECACHE_SCRIPT = BASE_DIR / "1_pre_cache_LTX23.py"
 TRAIN_SCRIPT = BASE_DIR / "2_train_lora_LTX23.py"
 
@@ -152,7 +157,17 @@ def get_dataset_dir():
     return resolve_config_path(cfg.get("dataset_path"), "./dataset")
 
 
+def get_precache_dir():
+    cfg = read_json_file(PRECACHE_CONFIG, {})
+    proj = cfg.get("project_name", "").strip()
+    if proj:
+        return resolve_config_path(f"cached_data_LTX23_{proj}", "cached_data_LTX23")
+    return resolve_config_path(cfg.get("cache_dir"), "cached_data_LTX23")
+
+
 def get_script_for_name(script_name):
+    if script_name == "caption":
+        return CAPTION_SCRIPT
     if script_name == "precache":
         return PRECACHE_SCRIPT
     if script_name == "train":
@@ -328,7 +343,7 @@ def browse_dir():
 
     image_count = 0
     try:
-        image_count = sum(1 for f in target.iterdir() if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"))
+        image_count = sum(1 for f in target.iterdir() if f.is_file() and f.suffix.lower() in DATASET_EXTS)
     except Exception:
         pass
 
@@ -476,7 +491,10 @@ def save_precache():
             train_cfg["output_dir"] = f"./{output_dir_name}"
         if "trigger_word" in data:
             train_cfg["trigger_word"] = data["trigger_word"]
-        
+        for key in PREVIEW_KEYS:
+            if key in data:
+                train_cfg[key] = data[key]
+
         write_json_file(TRAIN_CONFIG, train_cfg)
 
         return jsonify({"status": "ok", "file": saved_files[0], "all_saved": saved_files})
@@ -500,6 +518,13 @@ def save_train():
 
         # 1. Guardar en raíz con nombre genérico
         write_json_file(TRAIN_CONFIG, data)
+
+        # El Pre-Cache codifica el prompt de las previews desde su propio json.
+        precache_cfg = read_json_file(PRECACHE_CONFIG, {})
+        for key in PREVIEW_KEYS:
+            precache_cfg[key] = data.get(key, "")
+        write_json_file(PRECACHE_CONFIG, precache_cfg)
+
         saved_files = [TRAIN_CONFIG.name]
 
         # 2. Guardar copia dentro de la carpeta del proyecto
@@ -605,6 +630,10 @@ def run_script():
                             if buffer:
                                 yield f"data: {json.dumps({'type': 'output', 'text': buffer, 'replace': False}, ensure_ascii=False)}\n\n"
                                 buffer = ""
+                        elif char == '\x1b':
+                            # Códigos ANSI (el ESC[A de las barras anidadas de tqdm): la consola web los mostraría como texto.
+                            while (char := process.stdout.read(1)) and not char.isalpha():
+                                pass
                         else:
                             buffer += char
 
@@ -687,25 +716,35 @@ def serve_preview(filename):
     return send_from_directory(str(output_dir), requested.name)
 
 
+def caption_path(image_path):
+    return image_path.with_suffix(".txt")
+
+
+def dataset_caption_paths(dataset_dir):
+    return [caption_path(f) for f in sorted(dataset_dir.iterdir()) if f.is_file() and f.suffix.lower() in DATASET_EXTS]
+
+
 @app.route("/api/dataset-info", methods=["GET"])
 def dataset_info():
     dataset_dir = get_dataset_dir()
     images = []
     if dataset_dir.is_dir():
         for file_path in sorted(dataset_dir.iterdir()):
-            if file_path.is_file() and file_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
-                txt_path = file_path.with_suffix(".txt")
+            if file_path.is_file() and file_path.suffix.lower() in DATASET_EXTS:
+                txt_path = caption_path(file_path)
                 caption = ""
                 if txt_path.exists():
                     try:
                         caption = txt_path.read_text(encoding="utf-8").strip()
                     except Exception:
                         pass
-                images.append({"file": file_path.name, "has_txt": txt_path.exists(), "caption": caption})
+                # mtime va a la URL (?v=) para que el navegador no muestre una imagen reemplazada desde su caché.
+                images.append({"file": file_path.name, "mtime": int(file_path.stat().st_mtime),
+                               "has_txt": txt_path.exists(), "caption": caption})
     return jsonify({
         "path": str(dataset_dir),
         "image_count": len(images),
-        "caption_count": sum(1 for img in images if img["has_txt"]),
+        "caption_count": sum(1 for t in dataset_caption_paths(dataset_dir) if t.exists()) if dataset_dir.is_dir() else 0,
         "images": images[:500]
     })
 
@@ -718,9 +757,12 @@ def serve_dataset_image(filename):
         requested.relative_to(dataset_dir.resolve())
     except Exception:
         return "", 403
-    if not requested.is_file() or requested.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+    if not requested.is_file() or requested.suffix.lower() not in DATASET_EXTS:
         return "", 404
-    return send_from_directory(str(dataset_dir), requested.name)
+    resp = send_from_directory(str(dataset_dir), requested.name)
+    # Sin Cache-Control el navegador aplica caché heurística y sigue mostrando una imagen reemplazada.
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 @app.route("/api/save-caption", methods=["POST"])
@@ -734,7 +776,7 @@ def save_caption():
         img_path = (dataset_dir / filename).resolve()
         img_path.relative_to(dataset_dir.resolve())
         
-        txt_path = img_path.with_suffix(".txt")
+        txt_path = caption_path(img_path)
         txt_path.write_text(caption, encoding="utf-8")
         
         return jsonify({"status": "ok", "file": txt_path.name})
@@ -744,23 +786,149 @@ def save_caption():
 
 @app.route("/api/batch-caption", methods=["POST"])
 def batch_caption():
+    """
+    Aplica a todos los captions: antepone el trigger donde falte y, si hay texto
+    común, lo añade al final (append), sustituye el caption (replace) o lo quita (remove).
+    """
     try:
         data = request.get_json(force=True)
         trigger = data.get("trigger_word", "").strip()
+        common = str(data.get("common", "") or "").strip()
+        mode = str(data.get("mode", "append") or "append").strip().lower()
         dataset_dir = get_dataset_dir()
         count = 0
-        if trigger and dataset_dir.is_dir():
-            for file_path in dataset_dir.iterdir():
-                if file_path.is_file() and file_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
-                    txt_path = file_path.with_suffix(".txt")
-                    text = ""
-                    if txt_path.exists():
-                        text = txt_path.read_text(encoding="utf-8").strip()
-                    if trigger.lower() not in text.lower():
-                        text = f"{trigger}, {text}".strip(", ")
-                        txt_path.write_text(text, encoding="utf-8")
-                        count += 1
+
+        if not dataset_dir.is_dir() or not (trigger or common):
+            return jsonify({"status": "ok", "updated_count": 0})
+
+        for txt_path in dataset_caption_paths(dataset_dir):
+            current = txt_path.read_text(encoding="utf-8").strip() if txt_path.exists() else ""
+
+            if not common:
+                text = current
+            elif mode == "remove":
+                # Quita el texto y la puntuación que lo rodeaba, sin tocar el resto del caption.
+                text = re.sub(re.escape(common), "", current, flags=re.IGNORECASE)
+                text = re.sub(r"\s{2,}", " ", text)
+                text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+                text = re.sub(r"^[\s,;:.]+", "", text)
+                text = re.sub(r"[,;:]\s*$", "", text).strip()
+            elif mode == "replace":
+                text = common
+            elif common.lower() in current.lower():
+                # Pulsar dos veces no duplica la frase.
+                text = current
+            elif current:
+                base = current if current[-1] in ".!?,;:" else current + "."
+                text = f"{base} {common}"
+            else:
+                text = common
+
+            # En modo remove no se antepone nada: se acaba de pedir quitar una palabra.
+            if mode != "remove" and trigger and trigger.lower() not in text.lower():
+                text = f"{trigger}, {text}".strip(", ")
+
+            if text != current:
+                txt_path.write_text(text, encoding="utf-8")
+                count += 1
+
         return jsonify({"status": "ok", "updated_count": count})
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+@app.route("/api/clear-captions", methods=["POST"])
+def clear_captions():
+    """
+    Borra el .txt de todas las imágenes. Se borra el fichero en vez de vaciarlo:
+    un .txt vacío contaría como caption y el pre-caché entrenaría con texto en blanco.
+    """
+    try:
+        dataset_dir = get_dataset_dir()
+        removed, errors = 0, []
+        if dataset_dir.is_dir():
+            for txt in dataset_caption_paths(dataset_dir):
+                if txt.exists():
+                    try:
+                        txt.unlink()
+                        removed += 1
+                    except Exception as exc:
+                        errors.append(f"{txt.name}: {exc}")
+        return jsonify({"status": "ok" if not errors else "partial", "removed": removed, "errors": errors})
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+@app.route("/api/delete-dataset-image", methods=["POST"])
+def delete_dataset_image():
+    """Borra una imagen del dataset y su .txt."""
+    try:
+        filename = str(request.get_json(force=True).get("file", "")).strip()
+        dataset_dir = get_dataset_dir()
+        target = (dataset_dir / filename).resolve()
+
+        # El nombre viene del navegador: tiene que seguir dentro del dataset.
+        if not filename or dataset_dir.resolve() not in target.parents:
+            return jsonify({"status": "error", "error": "Path outside the dataset / Ruta fuera del dataset"}), 400
+        if not target.is_file() or target.suffix.lower() not in DATASET_EXTS:
+            return jsonify({"status": "error", "error": f"Not found / No existe: {filename}"}), 404
+
+        removed = []
+        for f in (target, caption_path(target)):
+            if f.is_file():
+                f.unlink()
+                removed.append(f.name)
+        return jsonify({"status": "ok", "removed": removed})
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+@app.route("/api/delete-project-data", methods=["POST"])
+def delete_project_data():
+    """Vacía la pre-caché o la salida de entrenamiento del proyecto actual (sin borrar la carpeta)."""
+    try:
+        target = str(request.get_json(force=True).get("target", "")).strip().lower()
+        if target == "precache":
+            path = get_precache_dir()
+        elif target == "training":
+            path = get_train_output_dir()
+        else:
+            return jsonify({"status": "error", "error": f"Unknown target / Destino desconocido: {target}"}), 400
+
+        # Un proceso en marcha tiene ficheros abiertos en esas carpetas.
+        if get_status()["running"]:
+            return jsonify({"status": "error",
+                            "error": "A process is running. Stop it first. / Hay un proceso en marcha. Detenlo primero."}), 409
+
+        removed, errors = 0, []
+        if path.is_dir():
+            for entry in path.iterdir():
+                try:
+                    if entry.is_dir():
+                        shutil.rmtree(entry)
+                    else:
+                        entry.unlink()
+                    removed += 1
+                except Exception as exc:
+                    errors.append(f"{entry.name}: {exc}")
+        return jsonify({"status": "ok" if not errors else "partial", "removed": removed, "errors": errors, "path": str(path)})
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+@app.route("/api/caption-settings", methods=["GET"])
+def get_caption_settings():
+    return jsonify(read_json_file(CAPTION_CONFIG, {}))
+
+
+@app.route("/api/save-caption-settings", methods=["POST"])
+def save_caption_settings():
+    """Guarda los ajustes del auto-caption. Se fusiona para no perder lo editado a mano en el JSON."""
+    try:
+        merged = read_json_file(CAPTION_CONFIG, {})
+        merged.update(request.get_json(force=True) or {})
+        write_json_file(CAPTION_CONFIG, merged)
+        return jsonify({"status": "ok"})
     except Exception as exc:
         return jsonify({"status": "error", "error": str(exc)}), 500
 

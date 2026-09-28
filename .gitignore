@@ -1,0 +1,16 @@
+# Modelo y entorno / Model and environment
+LTX23-NF4/
+Captioner-Qwen3-VL-8B/
+venv/
+__pycache__/
+
+# Ejecuciones / Runs
+cached_data_*/
+LTX23_lora_output*/
+ltx23_lora_output*/
+
+# Ajustes y credenciales / Settings and credentials
+pre_cache_settings.json
+train_settings.json
+caption_settings.json
+HF_token.json

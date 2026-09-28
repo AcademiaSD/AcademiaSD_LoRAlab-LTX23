@@ -284,8 +284,8 @@ def ensure_ltx23_model_downloaded(local_path):
     print("=" * 80)
     print("WARNING / ATENCIÓN")
     print("=" * 80)
-    print("This will download more than 100 GB. This may take several minutes.")
-    print("Esto descargará más de 100 GB. Esto puede tardar varios minutos.")
+    print("This will download about 75 GB. This may take several minutes.")
+    print("Esto descargará unos 75 GB. Esto puede tardar varios minutos.")
     print("=" * 80)
 
     auto = os.environ.get("LTX_AUTO_CONFIRM_DOWNLOAD", "0").strip().lower()
@@ -309,12 +309,14 @@ def ensure_ltx23_model_downloaded(local_path):
     os.makedirs(local_path, exist_ok=True)
 
     print()
+    # El Transformer BF16 (~38 GB) no se usa: sale entero del repo NF4.
     print("Downloading / Descargando:", HF_BASE_REPO_ID)
     snapshot_download(
         repo_id=HF_BASE_REPO_ID,
         local_dir=local_path,
         token=token,
         max_workers=4,
+        ignore_patterns=["transformer/*"],
     )
 
     print()
@@ -376,8 +378,9 @@ def vram_peak_gb():
 def read_audio_channels(model_id, default=128):
     """
     Lee audio_in_channels del config.json del transformer en disco (0 VRAM).
+    El del repo NF4 (raíz) es el mismo que el de transformer/, que ya no se descarga.
     """
-    for rel in ("transformer/config.json", os.path.join("transformer", "config.json")):
+    for rel in ("config.json", os.path.join("transformer", "config.json")):
         p = os.path.join(model_id, rel)
         if os.path.exists(p):
             try:

@@ -1513,6 +1513,18 @@ def main():
 
     )
 
+    # Resto de parámetros (normas, tablas de modulación...): el trainer ya no carga
+    # el Transformer en BF16, así que tienen que ir junto a weights/.
+    covered = set(index["quantized"]) | set(index["unquantized"])
+    others = {
+        k: v.detach().cpu().contiguous()
+        for k, v in transformer.state_dict().items()
+        if not any(k.startswith(m + ".") for m in covered)
+    }
+    save_file(others, os.path.join(OUTPUT_DIR, "others.safetensors"))
+    print()
+    print("others.safetensors:", len(others), "tensores")
+
     print()
     print("=" * 80)
     print("CONVERSIÓN COMPLETADA")

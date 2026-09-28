@@ -1,4 +1,4 @@
-# AcademiaSD LoRAlab-LTX-2.3 Beta v0.76
+# AcademiaSD LoRAlab-LTX-2.3 Beta v0.93
 
 ![AcademiaSD_LoRAlab-Krea2](assets/portada.jpg)
 
@@ -60,12 +60,15 @@ Here is the exact architectural breakdown of how this is achieved:
   - Physical **GPU VRAM** usage (via `nvidia-smi` / `torch`).
   - **GPU Temperature (°C)** with dynamic color coding (Green <70°C, Orange 70–79°C, Red >80°C).
 - **🔑 Hugging Face Token Support**: Optional HF token management (`HF_token.json`) for faster model downloads with live progress bars (MBs, transfer speed, ETA).
-- **🖼️ Dataset Inspector & Inline Caption Editor**:
-  - Visual grid with status badges (🟢 **Green** = Caption present, 🔴 **Red** = Missing caption).
-  - Filename tags overlaid on thumbnails.
-  - Modal lightbox to view high-res images and **edit `.txt` captions directly on disk**.
-  - Batch tool to inject **Trigger Words** across all captions at once.
-- **⏱️ Exact Step Resume Checkpoints**: Interrupt or stop training at any step (e.g. Step 333); the exact state (`current_step.txt`, `optimizer.pt`, `adapter_model.safetensors`) is saved automatically. Click **Start/Resume** to continue from that exact step.
+- **✍️ Auto-Captions**: **Create Captions** writes one `.txt` per image with Qwen3-VL-8B (NF4, ~5.5 GB VRAM), the same captioner as the Qwen-Image 2.1 LoRAlab, with the trigger word first. The first time it downloads ~5 GB to `Captioner-Qwen3-VL-8B/`. The prompt is editable and **Overwrite** off only fills the missing captions.
+- **🖼️ Dataset Manager & Inline Caption Editor**:
+  - Visual grid with status badges (🟢 **Green** = Caption present, 🔴 **Red** = Missing caption), resizable by dragging.
+  - Modal lightbox to view high-res images and **edit `.txt` captions directly on disk** (warns before closing with unsaved changes).
+  - Batch tool: put the **Trigger Word** first and **Append / Replace / Remove** a common text in every caption. **Clear Captions** and a per-image delete button.
+- **🔄 Live Settings**: while training, **Save JSON** applies steps, save/preview every, preview settings and LR on the next step.
+- **🗑️ Delete Pre-Cache / Delete Training** buttons to empty the current project's folders.
+- **⏱️ Exact Step Resume Checkpoints**: Interrupt or stop training at any step (e.g. Step 333); the exact state (`current_step.txt`, `optimizer.pt`, `adapter_model.safetensors`) is saved automatically. Click **Start/Resume** to continue from that exact step. Resuming always keeps the checkpoint's rank and alpha.
+- **🏷️ LoRA Metadata**: exported LoRAs carry kohya-style metadata (trigger word, rank, steps, resolution) that CivitAI and LoRA managers read.
 - **📂 Automatic Project Folder Management**: Dynamically routes cache and outputs to `./cached_data_LTX23_<project>` and `./LTX23_lora_output_<project>` based on your project name.
 - **🚀 One-Click WebUI Export ("Send to Models")**: Export the best `.safetensors` LoRA directly to your preferred WebUI folder (ComfyUI, ForgeNeo, etc.).
 - **🌐 Fully Bilingual (English / Español)**: All buttons, console logs, dialogs, and progress bars display labels in both English and Spanish.
@@ -100,6 +103,8 @@ Here is the exact architectural breakdown of how this is achieved:
 4. **Update the application**:
    You can check for and apply updates at any time by running `Update_LoRAlab-LTX23.bat`.
 
+> **Model download:** the transformer is loaded only from the NF4 repo `AcademiaSD/LTX23_NF4`; the BF16 `transformer/` of `diffusers/LTX-2.3-Diffusers` (~38 GB) is no longer downloaded. **Updating from v0.76:** the first training downloads `LTX23-NF4/others.safetensors` (13 MB) and you can delete the old folder `LTX23-NF4/transformer`.
+
 ---
 
 ## ⚡ Usage Guide
@@ -116,18 +121,21 @@ Double-click the Updater LoRAlab-LTX2.3.
 Update_LoRAlab-LTX23.bat
 ```
 
-### 2. Pre-Cache Dataset
-1. Enter a **Project Name** (e.g., `cherry2`).
+### 2. Captions (optional)
+1. Enter a **Project Name** (e.g., `cherry2`) and a **Trigger Word**.
 2. Select your image folder using the native Windows file requester (**Browse / Explorar**).
-3. Set your target resolution (e.g., `768x768`) and **Multiple** (`8`, `16`, `32`, or `64`).
-4. Click **Start Pre-Cache / Iniciar Pre-Caché**.
+3. In the Dataset Manager, click **Create Captions / Crear Captions** and review them before pre-caching.
 
-### 3. Train LoRA
+### 3. Pre-Cache Dataset
+1. Set your target resolution (e.g., `768x768`) and **Multiple** (`8`, `16`, `32`, or `64`).
+2. Click **Start Pre-Cache / Iniciar Pre-Caché**.
+
+### 4. Train LoRA
 1. Configure **Total Steps** (e.g., `1200`), **Learning Rate** (e.g., `0.0001`), **LoRA Rank/Alpha**, and **Save Every**.
 2. Click **Start / Resume**.
 3. You can stop training at any time by clicking **Stop Training**; exact step state will be saved automatically for seamless resuming.
 
-### 4. Export to ComfyUI / WebUI
+### 5. Export to ComfyUI / WebUI
 1. Enter your preferred **Final LoRA Filename** (e.g., `my_character.safetensors`).
 2. Select your ComfyUI / Forge / A1111 `models/loras` directory using **Browse / Explorar**.
 3. Click **🚀 Send to Models**.
@@ -141,14 +149,16 @@ AcademiaSD_LoRAlab-LTX23/
 ├── assets/
 │   ├── banner.png             # Web GUI top header banner
 │   └── logo.png               # Logo & browser favicon
+├── 0_caption_LTX23.py          # Dataset auto-captioning (Qwen3-VL-8B)
 ├── 1_pre_cache_LTX23.py        # Latent VAE & Text Embedding pre-caching script
-├── 2_train_lora_LTX232.py       # DiT 12B NF4 LoRA training script
+├── 2_train_lora_LTX23.py       # DiT 22B NF4 LoRA training script
 ├── server.py                   # Flask backend web server
 ├── trainer_ui.html             # HTML5 / CSS3 / JS Web GUI
 ├── Run_LoRAlab-LTX23.bat       # Windows 1-click launcher
 ├── Update_LoRAlab-LTX23.bat    # Updater
 ├── pre_cache_settings.json     # Active pre-cache configuration
 ├── train_settings.json         # Active training configuration
+├── caption_settings.json       # Auto-caption prompt and options
 └── HF_token.json               # Optional Hugging Face access token
 ```
 
